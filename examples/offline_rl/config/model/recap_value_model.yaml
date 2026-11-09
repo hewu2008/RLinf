@@ -5,9 +5,9 @@ precision: bf16
 # Not supported for this model
 is_lora: false
 
-siglip_path: /path/to/siglip2-so400m-patch14-224
-gemma3_path: /path/to/gemma-3-270m
-tokenizer_path: /path/to/gemma-3-270m
+siglip_path: /data/4T-1/hewu/model_zoo/siglip2-so400m-patch14-224
+gemma3_path: /data/4T-1/hewu/model_zoo/gemma-3-270m
+tokenizer_path: /data/4T-1/hewu/model_zoo/gemma-3-270m
 
 # "gemma_1m" | "gemma_50m" | "gemma_100m" | "gemma_150m" | "gemma_300m" | "gemma_2b"
 critic_expert_variant: "gemma_1m"

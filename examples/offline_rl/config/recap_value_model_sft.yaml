@@ -26,26 +26,20 @@ runner:
     experiment_name: "value_sft"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 30000
+  max_epochs: 10
   max_steps: -1
   val_check_interval: 500
-  save_interval: 3000
+  save_interval: 2000
 
 data:
   # Must match Step 1's data.tag; loads meta/returns_{tag}.parquet (null = legacy meta/returns.parquet)
-  tag: null
-
+  tag: "parts"
+  
   train_data_paths:
-    - dataset_path: "/path/to/sft_dataset"
+    - dataset_path: "/data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask"
       type: "sft"
       weight: 1.0
-      robot_type: "libero"
-      model_type: "pi05"
-
-  eval_data_paths:
-    - dataset_path: "/path/to/eval_dataset"
-      max_samples: 10000
-      robot_type: "libero"
+      robot_type: "zerith"
       model_type: "pi05"
 
   train_num_workers: 8
@@ -55,11 +49,11 @@ data:
   pin_memory: false
   include_state: true
   gamma: 1.0
-  action_horizon: 10
+  action_horizon: 50
   normalize_to_minus_one_zero: true
   include_next_obs: false
-  action_dim: 7
-  robot_type: "libero"
+  action_dim: 32
+  robot_type: "zerith"
   model_type: "pi05"
   balance_weights: true
   seed: 42
@@ -76,12 +70,12 @@ actor:
 
   model:
     precision: bf16
-    siglip_path: "/path/to/siglip"
-    gemma3_path: "/path/to/gemma3"
-    tokenizer_path: "/path/to/gemma3"
+    siglip_path: "/data/4T-1/hewu/model_zoo/siglip2-so400m-patch14-224"
+    gemma3_path: "/data/4T-1/hewu/model_zoo/gemma-3-270m"
+    tokenizer_path: "/data/4T-1/hewu/model_zoo/gemma-3-270m"
     freeze_vlm: false
-    action_dim: 7
-    action_horizon: 10
+    action_dim: 32
+    action_horizon: 50
 
   optim:
     lr: 5.0e-5
@@ -93,7 +87,7 @@ actor:
     clip_grad: 1.0
     lr_scheduler: "constant"
     lr_warmup_steps: 500
-    total_training_steps: 8000
+    total_training_steps: 18110  # 10 epochs x 1811 steps/epoch (2 GPUs)
 
   fsdp_config:
     strategy: "fsdp"

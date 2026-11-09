@@ -41,7 +41,11 @@ from openpi.transforms import DataTransformFn
 from torch.utils.data import Dataset
 
 from rlinf.data.storage.lerobot import episode_boundaries
-from rlinf.models.embodiment.openpi.policies import franka_policy, libero_policy
+from rlinf.models.embodiment.openpi.policies import (
+    franka_policy,
+    libero_policy,
+    zerith_policy,
+)
 
 from .common import BaseDataLoaderImpl, ReCapMixtureDataset
 from .utils import (
@@ -84,6 +88,14 @@ _REPACK_KEYS = {
         "observation/wrist_image": "wrist_image",
         "observation/state": "state",
         "actions": "actions",
+        "prompt": "prompt",
+    },
+    "zerith": {
+        "observation/image": "observation.images.cam_high",
+        "observation/left_wrist_image": "observation.images.cam_left_wrist",
+        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+        "observation/state": "observation.state",
+        "actions": "action",
         "prompt": "prompt",
     },
 }
@@ -327,6 +339,13 @@ class ValueDataset(Dataset):
         elif robot in ("franka", "franka_co_train"):
             transforms_list.append(
                 franka_policy.FrankaEEInputs(
+                    action_dim=action_dim,
+                    model_type=model_type_enum,
+                )
+            )
+        elif robot == "zerith":
+            transforms_list.append(
+                zerith_policy.ZerithInputs(
                     action_dim=action_dim,
                     model_type=model_type_enum,
                 )

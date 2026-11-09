@@ -4,15 +4,15 @@
 data:
   data_root: null
   train_data_paths:
-    - dataset_path: /path/to/sft_dataset
+    - dataset_path: /data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask
       type: sft
-    - dataset_path: /path/to/rollout_dataset
-      type: rollout
+    # - dataset_path: /path/to/rollout_dataset
+    #   type: rollout
 
   dataset_type: "sft"
   gamma: 1.0
   failure_reward: -300.0
-  tag: null
+  tag: "parts"
   num_workers: 128
 
 hydra:

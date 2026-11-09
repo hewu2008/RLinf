@@ -131,6 +131,13 @@ KEY_MAPPINGS = {
         "observation.gripper_position": "observation/gripper_position",
         "task": "prompt",
     },
+    "zerith": {
+        "observation.images.cam_high": "observation/images/base_0_rgb",
+        "observation.images.cam_left_wrist": "observation/images/left_wrist_0_rgb",
+        "observation.images.cam_right_wrist": "observation/images/right_wrist_0_rgb",
+        "observation.state": "observation/state",
+        "task": "prompt",
+    },
 }
 
 
