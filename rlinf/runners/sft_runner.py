@@ -14,6 +14,7 @@
 
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, Optional, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -23,6 +24,7 @@ from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.checkpoint import parse_global_step_from_checkpoint_path
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger
+from rlinf.utils.metric_utils import print_metrics_table
 from rlinf.utils.runner_utils import EarlyStopController, check_progress
 
 if TYPE_CHECKING:
@@ -56,6 +58,12 @@ class SFTRunner:
         # compute `max_steps`
         self.set_max_steps()
 
+        self.log_interval = int(cfg.runner.get("log_interval", 1))
+        if self.log_interval < 1:
+            raise ValueError(
+                f"runner.log_interval must be >= 1, got {self.log_interval}."
+            )
+
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
 
         self.metric_logger = MetricLogger(cfg)
@@ -77,6 +85,7 @@ class SFTRunner:
 
     def run(self) -> None:
         start_step = self.global_step
+        start_time = time.time()
         global_pbar = tqdm(
             initial=start_step,
             total=self.max_steps,
@@ -145,6 +154,17 @@ class SFTRunner:
 
             global_pbar.set_postfix(logging_metrics, refresh=False)
             global_pbar.update(1)
+
+            if (_step + 1) % self.log_interval == 0:
+                print_metrics_table(
+                    _step,
+                    self.max_steps,
+                    start_time,
+                    logging_metrics,
+                    start_step,
+                    self.metric_logger.log_path,
+                )
+
             if should_stop:
                 break
 
