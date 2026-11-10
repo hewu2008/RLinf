@@ -648,7 +648,7 @@ _CONFIGS = [
             # then taken from this repo_id, so it must match the checkpoint layout
             # (models/pi05-pytorch-base ships zerith/norm_stats.json).
             repo_id="zerith",
-            base_config=DataConfig(prompt_from_task=False),
+            base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(asset_id="zerith"),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_zerith",

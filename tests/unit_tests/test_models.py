@@ -1430,6 +1430,26 @@ def test_so101_dataconfig_repacks_lerobot_task_as_prompt():
     assert "task" not in repacked
 
 
+def test_zerith_dataconfig_action_sequence_keys_are_raw_lerobot_columns():
+    pytest.importorskip("numpy")
+    pytest.importorskip("openpi")
+    from openpi.models.pi0_config import Pi0Config
+
+    from rlinf.models.embodiment.openpi.dataconfig.zerith_dataconfig import (
+        LeRobotZerithDataConfig,
+    )
+
+    data_config = LeRobotZerithDataConfig(repo_id="zerith").create(
+        assets_dirs=Path("/tmp/nonexistent-openpi-assets"),
+        model_config=Pi0Config(pi05=True),
+    )
+    repack_structure = data_config.repack_transforms.inputs[0].structure
+
+    # LeRobot expands delta_timestamps over raw dataset columns; only the
+    # repack transform afterwards renames them to the OpenPI keys.
+    assert set(data_config.action_sequence_keys) <= set(repack_structure.values())
+
+
 def _stub_apxinf_robo(monkeypatch, resolved_tactics=None):
     """Install a fake ``apxinf_robo`` and record what ``_load_model`` asks it for."""
     seen = {}

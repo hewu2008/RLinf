@@ -354,8 +354,6 @@ class FSDPCfgWorker(FSDPSftWorker):
                     self.load_optimizer(self.device)
 
             self.model.train()
-            if hasattr(self.model, "gradient_checkpointing_disable"):
-                self.model.gradient_checkpointing_disable()
 
             assert (
                 self.cfg.actor.global_batch_size
