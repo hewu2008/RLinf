@@ -17,6 +17,39 @@ import torch
 from omegaconf import DictConfig
 
 
+def _apply_vlm_lora(model, rank: int) -> None:
+    """Inject LoRA adapters into the VLM language model.
+
+    SigLIP and the VLM base weights stay frozen while the action expert and the
+    action/state projections keep training fully. ``inject_adapter_in_model``
+    rewrites the Linear layers in place, so the module tree the guidance path
+    indexes into is unchanged.
+    """
+    from peft import LoraConfig, inject_adapter_in_model
+
+    vlm = model.paligemma_with_expert.paligemma
+    inject_adapter_in_model(
+        LoraConfig(
+            r=rank,
+            lora_alpha=2 * rank,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
+        vlm.language_model,
+    )
+    for name, param in vlm.named_parameters():
+        param.requires_grad = "lora_" in name
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
@@ -66,6 +99,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
         for weight_path in weight_paths:
             safetensors.torch.load_model(model, weight_path, strict=False)
+
+    if cfg.get("is_lora", False):
+        _apply_vlm_lora(model, int(cfg.get("lora_rank") or 32))
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     data_config = actor_train_config.data.create(

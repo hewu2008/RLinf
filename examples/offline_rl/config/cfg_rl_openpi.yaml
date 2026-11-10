@@ -57,6 +57,8 @@ actor:
     model_path: "/data/4T-1/hewu/model_zoo/pi05-pytorch-base"
     model_type: "cfg_model"
     add_value_head: False
+    is_lora: true
+    lora_rank: 32
     openpi:
       config_name: "pi05_zerith"
       cfgrl_guidance_scale: 1.0
@@ -80,7 +82,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    use_orig_params: False
+    use_orig_params: True
     gradient_checkpointing: True
     mixed_precision:
       param_dtype: ${actor.model.precision}
