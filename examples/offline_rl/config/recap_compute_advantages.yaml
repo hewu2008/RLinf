@@ -7,7 +7,7 @@ defaults:
   - model/recap_value_model@advantage.model
 
 advantage:
-  value_checkpoint: /data/4T-1/hewu/alg-product/RLinf/logs/value_sft/recap_value_model_sft-20261109-18:51:25/value_sft/checkpoints/global_step_4000
+  value_checkpoint: /data/4T-1/hewu/alg-product/RLinf/logs/value_sft/recap_value_model_sft-20261109-18:51:25/value_sft/checkpoints/global_step_4000/actor/model_state_dict
   batch_size: 1024
   flush_interval: 256
   num_dataloader_workers_per_gpu: 12
@@ -35,7 +35,7 @@ data:
       type: "sft"
       weight: 1.0
 
-  advantage_lookahead_step: 10
+  advantage_lookahead_step: 50
   gamma: 1.0
 
 distributed:

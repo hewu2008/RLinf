@@ -47,6 +47,11 @@ import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+# The DataLoader hands over thousands of small CPU tensors per batch (one dict
+# of images/state/tokens per frame), and the default file-descriptor sharing
+# opens a handle per storage, which exhausts the fd limit on large batches.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 try:  # lerobot >= 0.2 layout
     from lerobot.datasets.lerobot_dataset import (
         LeRobotDataset,

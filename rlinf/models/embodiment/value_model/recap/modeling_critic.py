@@ -684,6 +684,11 @@ class ValueCriticModel(nn.Module):
 
         model.processor = processor
         model = model.to(device)
+        # FSDP mixed precision ran the trained forward pass entirely in the
+        # backbone dtype, so collapse the fp32 layers kept for training
+        # stability into that dtype too; leaving them mixed makes layer norms
+        # fail on bf16 activations without an autocast context.
+        model = model.to(dtype=model._get_model_dtype())
         model.eval()
 
         # Load norm stats
