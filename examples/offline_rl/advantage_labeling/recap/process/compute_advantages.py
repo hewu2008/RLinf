@@ -132,9 +132,9 @@ KEY_MAPPINGS = {
         "task": "prompt",
     },
     "zerith": {
-        "observation.images.cam_high": "observation/images/base_0_rgb",
-        "observation.images.cam_left_wrist": "observation/images/left_wrist_0_rgb",
-        "observation.images.cam_right_wrist": "observation/images/right_wrist_0_rgb",
+        "observation.images.cam_high": "observation/image",
+        "observation.images.cam_left_wrist": "observation/left_wrist_image",
+        "observation.images.cam_right_wrist": "observation/right_wrist_image",
         "observation.state": "observation/state",
         "task": "prompt",
     },

@@ -7,21 +7,21 @@ defaults:
   - model/recap_value_model@advantage.model
 
 advantage:
-  value_checkpoint: /path/to/value_checkpoint
+  value_checkpoint: /data/4T-1/hewu/alg-product/RLinf/logs/value_sft/recap_value_model_sft-20261109-18:51:25/value_sft/checkpoints/global_step_4000
   batch_size: 1024
   flush_interval: 256
   num_dataloader_workers_per_gpu: 12
   prefetch_factor: 2
   discount_next_value: true
   positive_quantile: 0.3
-  tag: null
-  returns_tag: null
+  tag: "parts"
+  returns_tag: "parts"
 
   model:
     critic_expert_variant: "gemma_1m"
-    tokenizer_path: /path/to/gemma-3-270m
-    siglip_path: /path/to/siglip2-so400m-patch14-224
-    gemma3_path: /path/to/gemma-3-270m
+    tokenizer_path: "/data/4T-1/hewu/model_zoo/gemma-3-270m"
+    siglip_path: "/data/4T-1/hewu/model_zoo/siglip2-so400m-patch14-224"
+    gemma3_path: "/data/4T-1/hewu/model_zoo/gemma-3-270m"
 
 data:
   # openpi variant the value model was trained with ("pi0" / "pi05"). Must
@@ -30,8 +30,8 @@ data:
   model_type: "pi05"
 
   train_data_paths:
-    - dataset_path: "/path/to/sft_dataset"
-      robot_type: "libero"
+    - dataset_path: "/data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask"
+      robot_type: "zerith"
       type: "sft"
       weight: 1.0
 

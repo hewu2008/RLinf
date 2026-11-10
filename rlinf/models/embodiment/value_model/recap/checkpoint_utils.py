@@ -154,6 +154,7 @@ def build_input_transforms(
     from rlinf.models.embodiment.openpi.policies import (
         franka_policy,
         libero_policy,
+        zerith_policy,
     )
 
     _mt_map = {
@@ -173,6 +174,14 @@ def build_input_transforms(
         input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         input_transforms.append(
             franka_policy.FrankaEEInputs(
+                action_dim=action_dim, model_type=model_type_enum
+            )
+        )
+
+    elif env_type == "zerith":
+        input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
+        input_transforms.append(
+            zerith_policy.ZerithInputs(
                 action_dim=action_dim, model_type=model_type_enum
             )
         )
