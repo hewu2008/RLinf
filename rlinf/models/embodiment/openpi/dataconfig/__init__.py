@@ -82,6 +82,9 @@ from rlinf.models.embodiment.openpi.dataconfig.so101_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.yam_dataconfig import (
     LeRobotYamDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.zerith_dataconfig import (
+    LeRobotZerithDataConfig,
+)
 
 _CONFIGS = [
     TrainConfig(
@@ -635,6 +638,20 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="yam"),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
+    ),
+    TrainConfig(
+        name="pi05_zerith",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, action_dim=32),
+        data=LeRobotZerithDataConfig(
+            # Norm stats are resolved as <model_path>/<asset_id>/norm_stats.json.
+            # A local dataset path replaces repo_id at runtime, and asset_id is
+            # then taken from this repo_id, so it must match the checkpoint layout
+            # (models/pi05-pytorch-base ships zerith/norm_stats.json).
+            repo_id="zerith",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(asset_id="zerith"),
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_zerith",
     ),
 ]
 

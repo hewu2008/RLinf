@@ -27,18 +27,18 @@ runner:
     logger_backends: ["tensorboard"]
 
   max_epochs: -1
-  max_steps: 30000
+  max_steps: 60000
   val_check_interval: -1
-  save_interval: 3000
+  save_interval: 6000
 
 data:
   num_workers: 8
-  advantage_tag: null
+  advantage_tag: "parts"
   balance_dataset_weights: true
   seed: 42
 
   train_data_paths:
-    - dataset_path: "/path/to/sft_dataset"
+    - dataset_path: "/data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask"
       type: "sft"
       weight: 1.0
 
@@ -54,11 +54,11 @@ actor:
 
   model:
     precision: null
-    model_path: "/path/to/pi05_base_pytorch"
+    model_path: "/data/4T-1/hewu/model_zoo/pi05-pytorch-base"
     model_type: "cfg_model"
     add_value_head: False
     openpi:
-      config_name: "pi05_libero"
+      config_name: "pi05_zerith"
       cfgrl_guidance_scale: 1.0
       unconditional_prob: 0.1
       train_expert_only: False
@@ -74,7 +74,7 @@ actor:
     clip_grad: 1.0
     lr_scheduler: "cosine"
     lr_warmup_steps: 5000
-    total_training_steps: 30000
+    total_training_steps: 60000
     min_lr: 0.0
 
   fsdp_config:

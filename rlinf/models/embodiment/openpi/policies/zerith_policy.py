@@ -98,3 +98,13 @@ class ZerithInputs(transforms.DataTransformFn):
             )
 
         return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class ZerithOutputs(transforms.DataTransformFn):
+    """Trim the padded action dim back to the 23 joints commanded by Zerith."""
+
+    action_dim: int = 23
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}
