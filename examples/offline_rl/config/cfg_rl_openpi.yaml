@@ -48,8 +48,8 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 32
-  global_batch_size: 512
+  micro_batch_size: 8
+  global_batch_size: 16
   seed: 0
 
   model:
