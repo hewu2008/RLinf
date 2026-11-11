@@ -6,3 +6,9 @@ websockets>=15.0.1
 msgpack>=1.1.0
 numpy
 opencv-python
+
+# Imports of the vendor camera_client and its generated protobuf stubs; the
+# proto stubs refuse to load below these versions.
+av
+grpcio>=1.75.1
+protobuf>=6.31.1,<7

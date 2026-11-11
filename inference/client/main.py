@@ -190,7 +190,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sdk_dir",
         default=None,
-        help="directory holding lib_h1_sdk_python and camera_client (default: client/lib)",
+        help=(
+            "directory holding lib_h1_sdk_python and camera_client "
+            "(default: $H1_SDK_DIR, then client/lib)"
+        ),
     )
     parser.add_argument(
         "--grpc_target", default="localhost:50051", help="camera service gRPC target"

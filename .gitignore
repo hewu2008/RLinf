@@ -7,6 +7,8 @@ __pycache__
 !requirements/**
 # The remote inference tool ships its own dependency list.
 !inference/requirements.txt
+# The H1 vendor SDK is a local copy of shared objects and protobuf stubs.
+inference/client/lib/
 !docs/*
 *.DS_Store
 *.out

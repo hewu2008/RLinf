@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from inference import protocol
+from inference.client.h1_robot import camera_source_candidates, motor_position
 from inference.client.rtc_scheduler import RTCScheduler
 
 ACTION_DIM = 23
@@ -201,6 +202,29 @@ def test_build_env_obs_orders_the_three_views_and_the_state():
             default_prompt="fallback",
             action_dim=ACTION_DIM,
         )
+
+
+def test_h1_client_resolves_camera_aliases_and_sdk_motor_replies():
+    class _MotorInformation:
+        """Stand-in for the SDK's ``Motor_Information``."""
+
+        def __init__(self, position: float) -> None:
+            self.Position_Actual = position
+
+    assert camera_source_candidates("cam_high") == (
+        "cam_high",
+        "rs/cam_high",
+        "rs.cam_high",
+        "rs_cam_high",
+    )
+
+    info = _MotorInformation(0.25)
+    assert motor_position((True, info), 7, _MotorInformation) == 0.25
+    assert motor_position(info, 7, _MotorInformation) == 0.25
+    with pytest.raises(RuntimeError, match="failed read"):
+        motor_position((False, info), 7, _MotorInformation)
+    with pytest.raises(TypeError, match="Motor_Information"):
+        motor_position(True, 7, _MotorInformation)
 
 
 def test_pack_unpack_round_trips_arrays_and_bytes():

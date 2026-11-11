@@ -23,6 +23,7 @@ the client still imports on a machine without it.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAMERA_NAMES = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 DEFAULT_GRPC_TARGET = "localhost:50051"
 
+SDK_DIR_ENV_VAR = "H1_SDK_DIR"
+CAMERA_SOURCE_PREFIXES = ("", "rs/", "rs.", "rs_")
+
 ARM_MOTOR_COUNT = 8  # Seven joints and one gripper per arm.
 WAIST_MOTOR_COUNT = 3  # Lift, pitch, yaw.
 HEAD_MOTOR_COUNT = 2
@@ -46,11 +50,44 @@ STATE_DIM = (
 FRAME_POLL_INTERVAL_SECONDS = 0.01
 
 
+def camera_source_candidates(camera_name: str) -> tuple[str, ...]:
+    """Names the camera service may publish one logical camera under.
+
+    Devices whose streams come from RealSense cameras are registered with an
+    ``rs`` prefix, so try the plain name and every prefixed form.
+    """
+    return tuple(f"{prefix}{camera_name}" for prefix in CAMERA_SOURCE_PREFIXES)
+
+
+def motor_position(state: Any, motor_index: int, motor_information_cls: type) -> float:
+    """Read ``Position_Actual`` out of one ``getMotorState`` reply.
+
+    The SDK answers with ``(ok, Motor_Information)``, where ``ok`` is the C++
+    side's success flag; a failed read reports no position at all.
+    """
+    if isinstance(state, (list, tuple)) and len(state) == 2:
+        ok, state = bool(state[0]), state[1]
+        if not ok:
+            raise RuntimeError(f"getMotorState({motor_index}) reported a failed read")
+    if isinstance(state, motor_information_cls):
+        return float(state.Position_Actual)
+    raise TypeError(
+        f"getMotorState({motor_index}) returned {type(state)!r}; "
+        "expected Motor_Information"
+    )
+
+
 def _ensure_sdk_on_path(sdk_dir: str | None) -> None:
-    """Make the vendor SDK importable from ``sdk_dir`` or ``client/lib``."""
+    """Make the vendor SDK importable.
+
+    ``sdk_dir`` wins, then ``$H1_SDK_DIR``, then the ``client/lib`` directory the
+    robot machine is expected to carry.
+    """
     candidates = []
     if sdk_dir:
         candidates.append(Path(sdk_dir).expanduser())
+    if os.environ.get(SDK_DIR_ENV_VAR):
+        candidates.append(Path(os.environ[SDK_DIR_ENV_VAR]).expanduser())
     candidates.append(Path(__file__).resolve().parent / "lib")
     for root in candidates:
         if not root.is_dir():
@@ -65,7 +102,9 @@ class CameraRecorder:
 
     ``CameraClient.get_latest_frame`` returns ``(frame, timestamp)`` in the
     camera's native BGR order, which is what :func:`inference.protocol.encode_frame`
-    expects.
+    expects. The camera service does not report which name each stream is
+    published under, so one camera resolves its source on the first frame it
+    receives and keeps using that name.
     """
 
     def __init__(
@@ -79,6 +118,7 @@ class CameraRecorder:
         self.camera_names = tuple(camera_names)
         self._poll_interval = float(poll_interval)
         self._frames: dict[str, np.ndarray] = {}
+        self._sources: dict[str, str] = {}
         self._lock = threading.Lock()
         self._client = camera_client_cls(grpc_target=grpc_target)
         self._client.start()
@@ -92,20 +132,30 @@ class CameraRecorder:
 
     def _record(self, camera_name: str) -> None:
         while True:
-            try:
-                frame = self._client.get_latest_frame(camera_name)
-            except (
-                Exception
-            ) as error:  # The camera service drops frames while it reconnects.
-                logger.warning("reading camera %s failed: %s", camera_name, error)
-                time.sleep(self._poll_interval)
-                continue
+            frame = self._read_frame(camera_name)
             if frame is None:
                 time.sleep(self._poll_interval)
                 continue
             image, _ = frame
             with self._lock:
                 self._frames[camera_name] = image
+
+    def _read_frame(self, camera_name: str):
+        """Poll one camera, trying the source aliases until one answers."""
+        resolved = self._sources.get(camera_name)
+        candidates = (resolved,) if resolved else camera_source_candidates(camera_name)
+        for source in candidates:
+            try:
+                frame = self._client.get_latest_frame(source)
+            except (
+                Exception
+            ) as error:  # The camera service drops frames while it reconnects.
+                logger.warning("reading camera %s failed: %s", source, error)
+                continue
+            if frame is not None:
+                self._sources[camera_name] = source
+                return frame
+        return None
 
     def latest(self) -> dict[str, np.ndarray]:
         """Snapshot of the newest frame per camera."""
@@ -266,16 +316,7 @@ class H1RobotEnv:
 
     def _read_motor_position(self, index: int) -> float:
         state = self._robot.getMotorState(index)
-        if isinstance(state, self._motor_information_cls):
-            return float(state.Position_Actual)
-        if isinstance(state, (list, tuple)) and state:
-            first = state[0]
-            if isinstance(first, self._motor_information_cls):
-                return float(first.Position_Actual)
-        raise TypeError(
-            f"getMotorState({index}) returned {type(state)!r}; "
-            "expected Motor_Information"
-        )
+        return motor_position(state, index, self._motor_information_cls)
 
     def _interpolate_to(
         self,
