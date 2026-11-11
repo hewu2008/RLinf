@@ -1450,6 +1450,34 @@ def test_zerith_dataconfig_action_sequence_keys_are_raw_lerobot_columns():
     assert set(data_config.action_sequence_keys) <= set(repack_structure.values())
 
 
+def test_zerith_repack_splits_the_two_wrist_views():
+    from rlinf.models.embodiment.openpi.transforms.env import repack_env_obs
+
+    base = np.full((1, 4, 4, 3), 1, dtype=np.uint8)
+    left_wrist = np.full((1, 4, 4, 3), 2, dtype=np.uint8)
+    right_wrist = np.full((1, 4, 4, 3), 3, dtype=np.uint8)
+    states = np.arange(23, dtype=np.float32)[None]
+
+    repacked = repack_env_obs(
+        "pi05_zerith",
+        {
+            "main_images": base,
+            "extra_view_images": np.stack([left_wrist, right_wrist], axis=1),
+            "states": states,
+            "task_descriptions": ["sort the objects"],
+        },
+        select_state=lambda state: state,
+    )
+
+    assert repacked["observation/image"] is base
+    np.testing.assert_array_equal(repacked["observation/left_wrist_image"], left_wrist)
+    np.testing.assert_array_equal(
+        repacked["observation/right_wrist_image"], right_wrist
+    )
+    np.testing.assert_array_equal(repacked["observation/state"], states)
+    assert repacked["prompt"] == ["sort the objects"]
+
+
 def _stub_apxinf_robo(monkeypatch, resolved_tactics=None):
     """Install a fake ``apxinf_robo`` and record what ``_load_model`` asks it for."""
     seen = {}

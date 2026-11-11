@@ -5,6 +5,8 @@ __pycache__
 *.npy
 *.txt
 !requirements/**
+# The remote inference tool ships its own dependency list.
+!inference/requirements.txt
 !docs/*
 *.DS_Store
 *.out

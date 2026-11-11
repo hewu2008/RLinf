@@ -1,0 +1,8 @@
+# Dependencies of the remote inference server and client.
+# The server additionally needs a working RLinf embodied install (see
+# `bash requirements/install.sh embodied --model openpi --env <env>`); the robot
+# side needs only this list plus the H1 vendor SDK.
+websockets>=15.0.1
+msgpack>=1.1.0
+numpy
+opencv-python

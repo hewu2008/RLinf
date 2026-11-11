@@ -1,0 +1,51 @@
+# Server config of the remote inference server (inference/server/main.py).
+#
+# Every value here is static: the two placeholder paths below are the only
+# things to edit. See inference/run_server.sh for how a JAX checkpoint is
+# converted into the torch layout this file points at.
+model_type: openpi
+precision: null
+pi05: true
+is_lora: false
+
+# The service moves the model to the device itself, after the checkpoint load.
+load_to_device: false
+action_dim: 23
+num_action_chunks: 50
+num_steps: 10
+
+# A torch checkpoint: either an RLinf SFT run (full_weights.pt) or a converted
+# OpenPI layout (model.safetensors + config.json + <asset_id>/norm_stats.json).
+model_path: /path/to/pi05_zerith_openpi
+
+openpi:
+  task: eval
+  config_name: pi05_zerith
+  model_action_dim: 32
+  action_horizon: 50
+  action_chunk: 50
+  action_env_dim: 23
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  max_token_len: 200
+  torch_compile: true
+  # RTC guidance: a replan request is sampled against the unexecuted tail of the
+  # previous chunk. The client refuses to run in RTC mode if this is false.
+  rtc_enabled: true
+  rtc_guidance_mode: approx
+  rtc_guidance_clip: 5.0
+
+openpi_data:
+  norm_stats_path: /path/to/pi05_zerith_openpi/zerith/norm_stats.json
+
+server:
+  host: 0.0.0.0
+  port: 55555
+  # Unset the prompt on the client to fall back to this one.
+  default_prompt: "Sort all objects into the correct bins using both arms"
+  # Wire camera names per trained view; they must match the client's --camera_names.
+  camera_layout:
+    base: cam_high
+    left_wrist: cam_left_wrist
+    right_wrist: cam_right_wrist
+  warmup: true
