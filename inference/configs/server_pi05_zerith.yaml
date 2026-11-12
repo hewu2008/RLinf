@@ -49,6 +49,14 @@ openpi:
   # changing max_token_len, num_action_chunks or the camera resolution
   # re-captures it. --no-graph-sampler serves the loop eagerly.
   graph_sampler: true
+  # Attention kernel for the Gemma layers. "sdpa" serves the full-sequence
+  # (prefix) pass from the fused mem-efficient kernel instead of the eager
+  # fp32-logits math: 2.6x faster per prefix layer on an A100. Measured end to
+  # end that is only 1.8% of a request (attention is a small share of the
+  # 170ms denoise), and it moves the sampled chunk by up to 1.4e-1 on a
+  # synthetic observation, so this deployment keeps "eager". The incremental
+  # (suffix) steps stay on the eager path either way.
+  attn_backend: eager
 
 openpi_data:
   norm_stats_path: /data/4T-1/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi/zerith/norm_stats.json

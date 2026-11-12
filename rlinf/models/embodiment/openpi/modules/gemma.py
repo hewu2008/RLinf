@@ -24,6 +24,7 @@ Supports:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 from collections.abc import Sequence
@@ -33,10 +34,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from . import lora
 from .lora import FeedForward as LoRAFeedForward
-from .utils import _str_to_dtype, gelu_glu, torch_compile_enabled
+from .utils import (
+    _str_to_dtype,
+    attention_backend,
+    gelu_glu,
+    torch_compile_enabled,
+)
 
 PALIGEMMA_VOCAB_SIZE = 257_152
 
@@ -203,7 +210,6 @@ class Embedder(nn.Module):
         return F.linear(x, self.embedding.weight)
 
 
-# TODO: try use sdpa_attn
 class Attention(nn.Module):
     """Multi-expert Grouped Query Attention with RoPE and LoRA."""
 
@@ -345,37 +351,20 @@ class Attention(nn.Module):
         if attn_mask.dim() == 4:
             attn_mask = attn_mask[:, 0:1, :, :]  # (B, 1, T, S)
 
-        # GQA einsum pattern matching JAX:
-        q = q * (self.head_dim**-0.5)
-
-        # q: (B, T, num_heads, H) -> rearrange to (B, T, K, G, H)
-        # k: (B, S, num_kv_heads, H) -> stays (B, S, K, H)
-        K = self.num_kv_heads
-        G = self.num_heads // K
-
-        q_r = q.reshape(q.shape[0], q.shape[1], K, G, self.head_dim)
-        k_r = k.reshape(k.shape[0], k.shape[1], K, self.head_dim)
-        v_r = v.reshape(v.shape[0], v.shape[1], K, self.head_dim)
-
-        # einsum "BTKGH,BSKH->BKGTS"
-        logits = torch.einsum("BTKGH,BSKH->BKGTS", q_r.float(), k_r.float())
-
-        # Align mask to logits shape: logits is (B, K, G, T, S), mask is (B, 1, T, S)
-        # We need mask to be (B, 1, 1, T, S) so it broadcasts to (B, K, G, T, S)
-        big_neg = -2.3819763e38
-        mask_for_logits = attn_mask[:, :, None, :, :].expand_as(logits).bool()
-        # ``masked_fill`` takes the filler as a kernel argument; building it with
-        # ``torch.tensor(..., device=...)`` would copy host memory and abort a
-        # CUDA graph capture.
-        masked_logits = logits.masked_fill(~mask_for_logits, big_neg)
-
-        probs = F.softmax(masked_logits, dim=-1).to(dtype)
-
-        # einsum "BKGTS,BSKH->BTKGH"
-        encoded = torch.einsum("BKGTS,BSKH->BTKGH", probs, v_r.to(dtype))
-        encoded = encoded.reshape(
-            encoded.shape[0], encoded.shape[1], K * G, self.head_dim
+        # A KV cache means an incremental step: the query block is small, so the
+        # GQA copy the fused kernel needs does not amortise (1.6x slower there).
+        # Autograd keeps the eager math as well, because the math backend used
+        # off CUDA turns a fully masked row into NaN where the eager path yields
+        # a uniform average, and that row's gradient reaches the shared weights.
+        use_sdpa = (
+            kv_cache is None
+            and attention_backend() == "sdpa"
+            and not torch.is_grad_enabled()
         )
+        if use_sdpa:
+            encoded = self._attend_sdpa(q, k, v, attn_mask)
+        else:
+            encoded = self._attend_eager(q, k, v, attn_mask, dtype)
         # encoded: (B, T_total, num_heads, head_dim)
 
         # Split back to per-expert outputs
@@ -392,6 +381,76 @@ class Attention(nn.Module):
                 outputs.append(None)
 
         return outputs, new_kv_cache
+
+    def _attend_eager(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """fp32 logits, fp32 softmax, model-dtype ``P @ V``: the JAX-aligned math.
+
+        q is ``(B, T, num_heads, head_dim)``, k/v are ``(B, S, num_kv_heads,
+        head_dim)``, the mask is ``(B, 1, T, S)``. Returns ``(B, T, num_heads,
+        head_dim)``.
+        """
+        B, T = q.shape[0], q.shape[1]
+        K = self.num_kv_heads
+        G = self.num_heads // K
+        # GQA einsum pattern matching JAX: query head h attends to kv head h // G.
+        q_r = (q * (self.head_dim**-0.5)).reshape(B, T, K, G, self.head_dim)
+        k_r = k.reshape(B, k.shape[1], K, self.head_dim)
+        v_r = v.reshape(B, v.shape[1], K, self.head_dim)
+
+        logits = torch.einsum("BTKGH,BSKH->BKGTS", q_r.float(), k_r.float())
+
+        # ``masked_fill`` broadcasts the (B, 1, 1, T, S) mask; expanding it first
+        # to (B, K, G, T, S) cost 17% of the layer on a 968-token prefix. The
+        # filler is a kernel argument, so ``torch.tensor(..., device=...)`` —
+        # which would copy host memory — is not needed.
+        big_neg = -2.3819763e38
+        masked_logits = logits.masked_fill(~attn_mask[:, :, None, :, :], big_neg)
+
+        probs = F.softmax(masked_logits, dim=-1).to(dtype)
+        encoded = torch.einsum("BKGTS,BSKH->BTKGH", probs, v_r.to(dtype))
+        return encoded.reshape(B, T, K * G, self.head_dim)
+
+    def _attend_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Same attention from the fused kernel, with no fp32 logits in memory.
+
+        ``head_dim=256`` rules out the flash backend, and the mem-efficient one
+        needs one KV head per query head, so the group is materialised instead
+        of broadcast. That copy is why this serves the full-sequence pass only:
+        on a 968-token prefix it is 2.6x faster than :meth:`_attend_eager`, on a
+        50-query incremental step 1.6x slower. Attention is a small share of a
+        request, so the end-to-end win on Pi0.5 is ~2%; the attention output
+        itself moves by ~5e-3 relative.
+        """
+        group = self.num_heads // self.num_kv_heads
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2).repeat_interleave(group, dim=1)
+        v_t = v.transpose(1, 2).repeat_interleave(group, dim=1)
+        # Pin the backend on CUDA so a silent fall to the math backend (2x slower
+        # than the eager path) cannot hide here; other accelerators have no
+        # CUDA-only backend to select, so there torch dispatches on its own.
+        ctx = (
+            sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+            if q.is_cuda
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            out = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, attn_mask=attn_mask, scale=self.head_dim**-0.5
+            )
+        return out.transpose(1, 2)
 
 
 class FeedForward(nn.Module):

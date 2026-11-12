@@ -32,6 +32,26 @@ def torch_compile_enabled() -> bool:
     return _torch_compile_enabled
 
 
+# Attention kernel for the Gemma layers. ``eager`` is the JAX-aligned
+# fp32-logits math; ``sdpa`` serves the full-sequence pass from the fused
+# kernel. Set before the first forward.
+_attention_backend = "eager"
+
+
+def set_attention_backend(backend: str) -> None:
+    """Select the attention kernel used by the Gemma layers."""
+    global _attention_backend
+    if backend not in ("eager", "sdpa"):
+        raise ValueError(
+            f"attention backend must be 'eager' or 'sdpa', got {backend!r}"
+        )
+    _attention_backend = backend
+
+
+def attention_backend() -> str:
+    return _attention_backend
+
+
 def _gelu_glu_eager(
     gate_input: torch.Tensor, value_input: torch.Tensor
 ) -> torch.Tensor:

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import inspect
 import logging
@@ -1730,6 +1731,177 @@ def test_euler_denoise_loop_replays_from_a_graph():
     captured = sample(LoopGraphSampler(euler_denoise_loop))
 
     assert torch.equal(captured, eager)
+
+
+@pytest.fixture
+def attention_backend_switch():
+    """Yield the setter and restore the process-wide backend afterwards."""
+    from rlinf.models.embodiment.openpi.modules.utils import (
+        attention_backend,
+        set_attention_backend,
+    )
+
+    before = attention_backend()
+    yield set_attention_backend
+    set_attention_backend(before)
+
+
+def _dummy_attention(num_heads=None, num_kv_heads=None):
+    """Two-expert attention at toy size, like the prefix + action-expert pair."""
+    from rlinf.models.embodiment.openpi.modules import gemma
+
+    config = gemma.get_config("dummy")
+    if num_heads is not None:
+        config = dataclasses.replace(
+            config, num_heads=num_heads, num_kv_heads=num_kv_heads
+        )
+    return gemma.Attention([config, config]).eval(), config
+
+
+def _previous_attention(q, k, v, attn_mask, num_kv_heads, head_dim):
+    """The implementation before the mask broadcast, kept as the parity oracle."""
+    B, T = q.shape[0], q.shape[1]
+    K = num_kv_heads
+    G = q.shape[2] // K
+    q = q * (head_dim**-0.5)
+    q_r = q.reshape(B, T, K, G, head_dim)
+    k_r = k.reshape(B, k.shape[1], K, head_dim)
+    v_r = v.reshape(B, v.shape[1], K, head_dim)
+    logits = torch.einsum("BTKGH,BSKH->BKGTS", q_r.float(), k_r.float())
+    mask_for_logits = attn_mask[:, :, None, :, :].expand_as(logits).bool()
+    masked_logits = logits.masked_fill(~mask_for_logits, -2.3819763e38)
+    probs = torch.softmax(masked_logits, dim=-1).to(q.dtype)
+    encoded = torch.einsum("BKGTS,BSKH->BTKGH", probs, v_r.to(q.dtype))
+    return encoded.reshape(B, T, K * G, head_dim)
+
+
+def _reference_attention(q, k, v, attn_mask):
+    """Head-by-head attention, so the GQA grouping is checked independently."""
+    B, T, heads, head_dim = q.shape
+    group = heads // k.shape[2]
+    out = torch.zeros_like(q)
+    for head in range(heads):
+        kv_head = head // group
+        scores = torch.einsum("btd,bsd->bts", q[:, :, head], k[:, :, kv_head])
+        scores = (scores * head_dim**-0.5).masked_fill(~attn_mask[:, 0], float("-inf"))
+        out[:, :, head] = torch.einsum(
+            "bts,bsd->btd", scores.softmax(-1), v[:, :, kv_head]
+        )
+    return out
+
+
+def test_gemma_attention_eager_keeps_the_previous_numbers():
+    attention, config = _dummy_attention()
+    torch.manual_seed(0)
+    q = torch.randn(2, 5, config.num_heads, config.head_dim) * 0.3
+    k = torch.randn(2, 7, config.num_kv_heads, config.head_dim) * 0.3
+    v = torch.randn(2, 7, config.num_kv_heads, config.head_dim) * 0.3
+    mask = torch.ones(2, 1, 5, 7, dtype=torch.bool)
+    mask[:, :, 3:, 5:] = False
+
+    with torch.no_grad():
+        actual = attention._attend_eager(q, k, v, mask, q.dtype)
+    expected = _previous_attention(q, k, v, mask, config.num_kv_heads, config.head_dim)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "atol"), [(torch.float32, 1e-5), (torch.bfloat16, 3e-3)]
+)
+def test_gemma_attention_paths_match_the_reference(dtype, atol):
+    attention, config = _dummy_attention(num_heads=4, num_kv_heads=2)
+    torch.manual_seed(0)
+    q = torch.randn(2, 5, config.num_heads, config.head_dim, dtype=dtype) * 0.3
+    k = torch.randn(2, 7, config.num_kv_heads, config.head_dim, dtype=dtype) * 0.3
+    v = torch.randn(2, 7, config.num_kv_heads, config.head_dim, dtype=dtype) * 0.3
+    # Every query keeps at least one key, so no row is fully masked.
+    mask = torch.ones(2, 1, 5, 7, dtype=torch.bool)
+    mask[:, :, 3:, 5:] = False
+
+    with torch.no_grad():
+        eager = attention._attend_eager(q, k, v, mask, dtype)
+        sdpa = attention._attend_sdpa(q, k, v, mask)
+    expected = _reference_attention(q.float(), k.float(), v.float(), mask)
+
+    assert sdpa.dtype == dtype
+    for actual in (eager, sdpa):
+        torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=1e-2)
+
+
+def test_gemma_attention_masked_keys_cannot_leak_into_the_output():
+    attention, config = _dummy_attention()
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, config.num_heads, config.head_dim) * 0.3
+    k = torch.randn(1, 6, config.num_kv_heads, config.head_dim) * 0.3
+    v = torch.randn(1, 6, config.num_kv_heads, config.head_dim) * 0.3
+    mask = torch.ones(1, 1, 4, 6, dtype=torch.bool)
+    mask[:, :, :, 4:] = False
+    poisoned = v.clone()
+    poisoned[:, 4:] = 1e4
+
+    with torch.no_grad():
+        eager_before = attention._attend_eager(q, k, v, mask, q.dtype)
+        sdpa_before = attention._attend_sdpa(q, k, v, mask)
+        eager_after = attention._attend_eager(q, k, poisoned, mask, q.dtype)
+        sdpa_after = attention._attend_sdpa(q, k, poisoned, mask)
+
+    assert torch.equal(eager_after, eager_before)
+    assert torch.equal(sdpa_after, sdpa_before)
+
+
+def test_gemma_attention_sdpa_serves_the_full_sequence_pass_only(
+    attention_backend_switch, monkeypatch
+):
+    from rlinf.models.embodiment.openpi.modules import gemma
+
+    attention, config = _dummy_attention()
+    calls = []
+    real_sdpa = gemma.F.scaled_dot_product_attention
+
+    def counting_sdpa(*args, **kwargs):
+        calls.append(1)
+        return real_sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(gemma.F, "scaled_dot_product_attention", counting_sdpa)
+    torch.manual_seed(0)
+    prefix = torch.randn(1, 4, config.width)
+    mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    positions = torch.arange(4)[None]
+
+    attention_backend_switch("eager")
+    with torch.no_grad():
+        attention([prefix, None], positions, mask)
+    assert not calls, "the eager backend must not reach the fused kernel"
+
+    attention_backend_switch("sdpa")
+    with torch.no_grad():
+        attention([prefix, None], positions, mask)
+    assert calls, "the full-sequence pass must use the fused kernel"
+
+    calls.clear()
+    suffix = torch.randn(1, 2, config.width)
+    cache = (
+        torch.randn(1, 4, config.num_kv_heads, config.head_dim),
+        torch.randn(1, 4, config.num_kv_heads, config.head_dim),
+    )
+    with torch.no_grad():
+        attention(
+            [None, suffix],
+            positions[:, :2],
+            torch.ones(1, 1, 2, 6, dtype=torch.bool),
+            kv_cache=cache,
+        )
+    assert not calls, "an incremental step must keep the eager math"
+
+    with torch.enable_grad():
+        attention([prefix, None], positions, mask)
+    assert not calls, "autograd must keep the eager math"
+
+
+def test_set_attention_backend_rejects_an_unknown_name(attention_backend_switch):
+    with pytest.raises(ValueError, match="eager.*sdpa"):
+        attention_backend_switch("flash")
 
 
 def test_advantage_prompts_match_the_cfg_training_suffix():

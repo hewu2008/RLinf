@@ -24,7 +24,10 @@ from rlinf.models.embodiment.openpi.checkpoint import (
     resolve_full_weights,
     resolve_model_safetensors,
 )
-from rlinf.models.embodiment.openpi.modules.utils import set_torch_compile
+from rlinf.models.embodiment.openpi.modules.utils import (
+    set_attention_backend,
+    set_torch_compile,
+)
 from rlinf.models.embodiment.openpi.rlt_config import build_rlt_config
 from rlinf.utils.logging import get_logger
 
@@ -53,6 +56,10 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
 
     model_cfg = cfg.openpi
     set_torch_compile(bool(OmegaConf.select(model_cfg, "torch_compile", default=True)))
+    # Attention kernel for the Gemma layers, see ``modules.gemma.Attention``.
+    set_attention_backend(
+        str(OmegaConf.select(model_cfg, "attn_backend", default="eager"))
+    )
     # Existing Pi0.5 templates predate the explicit switch, so preserve their
     # behavior by default. Pi0 templates set this field to False explicitly.
     pi05 = bool(OmegaConf.select(cfg, "pi05", default=True))
