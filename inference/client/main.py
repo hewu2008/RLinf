@@ -30,7 +30,7 @@ import numpy as np
 
 from inference.client.async_infer import InferenceWorker
 from inference.client.control_loop import run_control_loop
-from inference.client.h1_robot import H1RobotEnv
+from inference.client.h1_robot import DEFAULT_CAMERA_NAMES, H1RobotEnv
 from inference.client.policy_client import WebsocketPolicyClient
 from inference.client.rtc_scheduler import RTCScheduler
 from inference.protocol import encode_frame
@@ -201,9 +201,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--camera_names",
         nargs="+",
-        choices=["cam_high", "cam_left_wrist", "cam_right_wrist"],
-        default=["cam_high", "cam_left_wrist", "cam_right_wrist"],
-        help="camera names, in the order the policy expects",
+        choices=list(DEFAULT_CAMERA_NAMES),
+        default=list(DEFAULT_CAMERA_NAMES),
+        help=(
+            "cameras to send; each name must appear as a value of "
+            "server.camera_layout, and the order does not matter because the "
+            "server places every view by name"
+        ),
     )
     parser.add_argument(
         "--deinit", action="store_true", help="release the robot when the loop finishes"

@@ -13,6 +13,9 @@
 # camera_client; without either, client/lib is used.
 # Client deps: pip install -r inference/requirements.txt
 #
+# HOST and PORT say where the policy server listens; they must match how it was
+# started (inference/run_server.sh reads the same two variables).
+#
 # prompt1: Pick and place the door handle into the left bin and the L-shaped bent pipe into the right bin
 # hdf5: 002e81207a19441bae7f4653ad759d7c
 #
@@ -24,8 +27,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 "${ROBOT_PYTHON:-python}" -m inference.client.main \
-  --host 172.31.200.200 \
-  --port 55555 \
+  --host "${HOST:-172.31.200.200}" \
+  --port "${PORT:-55555}" \
   --sdk_dir "${H1_SDK_DIR:-inference/client/lib}" \
   --prompt "Sort all objects into the correct bins using both arms" \
   --init_hdf5 /data/zerith_data/1_clear_the_bin_box_20261027/04742e2eb140434d87b5b8d213741c1e/episode.hdf5 \

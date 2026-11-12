@@ -5,6 +5,12 @@
 # returned action chunk with the record. No checkpoint is loaded locally, so
 # start inference/run_server.sh first.
 #
+# Every request omits the RTC block, so this checks the plain chunk path only;
+# the guidance that inference/run_client.sh relies on is not exercised here.
+#
+# HOST and PORT follow the server's own variables; 127.0.0.1 only works from the
+# machine running the server, so point HOST at it from anywhere else.
+#
 # Usage (from the repository root):
 #   bash scripts/run_open_loop_eval.sh
 #   TRAJ_IDS="0 1" MAX_CHUNKS=240 bash scripts/run_open_loop_eval.sh
@@ -21,9 +27,11 @@ DATA_PATH=${DATA_PATH:-/data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask
 TRAJ_IDS=${TRAJ_IDS:-"0 1 2 3"}
 MAX_CHUNKS=${MAX_CHUNKS:-240}
 CHUNK_STRIDE=${CHUNK_STRIDE:-}
-PROMPT=${PROMPT:-"Sort all objects into the correct bins using both arms"}
+# Empty values are meaningful: PROMPT= falls back to each sample's task and
+# SAVE_PLOT_DIR= skips the plots, so these two use "-" (unset only), not ":-".
+PROMPT=${PROMPT-"Sort all objects into the correct bins using both arms"}
 CAMERA_NAMES=${CAMERA_NAMES:-"cam_high cam_left_wrist cam_right_wrist"}
-SAVE_PLOT_DIR=${SAVE_PLOT_DIR:-./open_loop_test}
+SAVE_PLOT_DIR=${SAVE_PLOT_DIR-./open_loop_test}
 LOG_FILE=${LOG_FILE:-logs/open_loop_eval.log}
 
 # The dataset is local; keep transformers/lerobot from reaching for the hub.

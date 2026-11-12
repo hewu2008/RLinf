@@ -18,6 +18,8 @@ dist
 logs/*
 logs_baseline/*
 outputs/*
+# Default --save-plot-dir of scripts/run_open_loop_eval.sh.
+open_loop_test/
 *.so
 .venv
 .venv-*

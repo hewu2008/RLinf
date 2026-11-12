@@ -205,8 +205,23 @@ def evaluate_episode(
     pred_chunks: list[np.ndarray] = []
     latencies: list[float] = []
 
+    # A recorded chunk that runs past the episode end is padded with the
+    # boundary frame, so only frames with a full horizon are replayed.
+    last_full = end - action_horizon
+    if last_full < start:
+        logger.warning(
+            "episode %d has %d frames, shorter than the %d-step horizon; its "
+            "recorded chunk is padded and the error includes that tail",
+            episode,
+            end - start,
+            action_horizon,
+        )
+        request_frames = [start]
+    else:
+        request_frames = range(start, last_full + 1, chunk_stride)
+
     used_prompt = None
-    for frame in range(start, end, chunk_stride):
+    for frame in request_frames:
         if max_chunks > 0 and len(gt_chunks) >= max_chunks:
             break
         sample = dataset[frame]

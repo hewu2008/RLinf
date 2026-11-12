@@ -204,6 +204,60 @@ def test_build_env_obs_orders_the_three_views_and_the_state():
         )
 
 
+def test_open_loop_replays_only_frames_with_a_full_recorded_horizon():
+    pytest.importorskip("websockets")
+    from inference.open_loop_eval import DEFAULT_CAMERAS, evaluate_episode
+
+    horizon = 4
+
+    class _Dataset:
+        """One episode of ``length`` frames and a fixed recorded chunk."""
+
+        def __init__(self, length: int) -> None:
+            self.episode_data_index = {"from": np.array([0]), "to": np.array([length])}
+            self.requested: list[int] = []
+
+        def __getitem__(self, index: int) -> dict:
+            self.requested.append(index)
+            sample = {
+                "observation.state": np.zeros(ACTION_DIM, np.float32),
+                "action": np.zeros((horizon, ACTION_DIM), np.float32),
+                "task": "pick",
+            }
+            for camera in DEFAULT_CAMERAS:
+                sample[f"observation.images.{camera}"] = np.zeros((4, 4, 3), np.uint8)
+            return sample
+
+    class _Client:
+        def infer(self, observation) -> dict:
+            return {"actions": np.zeros((horizon, ACTION_DIM), np.float32)}
+
+    def _run(dataset: _Dataset) -> dict:
+        return evaluate_episode(
+            _Client(),
+            dataset,
+            0,
+            action_horizon=horizon,
+            action_dim=ACTION_DIM,
+            chunk_stride=horizon,
+            max_chunks=0,
+            prompt=None,
+            camera_names=DEFAULT_CAMERAS,
+            jpeg_quality=90,
+            raw_images=True,
+        )
+
+    dataset = _Dataset(length=10)
+    result = _run(dataset)
+    # Frames 8 and 9 would need recorded actions past the episode end.
+    assert dataset.requested == [0, 4]
+    assert result["gt"].shape == (2 * horizon, ACTION_DIM)
+
+    short = _Dataset(length=2)
+    _run(short)
+    assert short.requested == [0]
+
+
 def test_h1_client_resolves_camera_aliases_and_sdk_motor_replies():
     class _MotorInformation:
         """Stand-in for the SDK's ``Motor_Information``."""
