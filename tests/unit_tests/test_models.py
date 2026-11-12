@@ -45,9 +45,11 @@ from rlinf.models.embodiment.openpi.apxinf_adapter import (
     _active_token_ids,
 )
 from rlinf.models.embodiment.openpi.modules.model import IMAGE_KEYS, Observation
-from rlinf.models.embodiment.openpi.pi0 import Pi0
+from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop
+from rlinf.models.embodiment.openpi.sampling import rl_sampler
 from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
     RTCGuidanceContext,
+    rtc_denoise_loop,
     sample_actions_with_rtc_guidance,
 )
 from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval, advantage_prompts
@@ -1522,6 +1524,7 @@ class _BranchedVelocityPi0:
 
     action_horizon = 2
     action_dim = 2
+    _plain_denoise_fn = None
 
     def build_prefix_cache(self, observation):
         return None, torch.ones(1, 1, dtype=torch.bool), float(observation.state[0, 0])
@@ -1577,6 +1580,156 @@ def test_rtc_sampling_mixes_the_cfg_velocity():
     torch.testing.assert_close(v_plain, torch.zeros_like(v_plain))
     torch.testing.assert_close(v_advantage, -torch.ones_like(v_advantage))
     torch.testing.assert_close(v_mixed, 0.5 * (v_plain + v_advantage))
+
+
+def test_rtc_denoise_loop_matches_the_cfg_mix():
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    model = _BranchedVelocityPi0()
+    timesteps = rl_sampler.get_timesteps(4, torch.device("cpu"))
+    target = torch.zeros(1, model.action_horizon, model.action_dim)
+    mask = torch.zeros(1, model.action_horizon, 1)
+
+    def sample(observation, cond_observation=None, cfg_scale=0.0):
+        return rtc_denoise_loop(
+            model,
+            observation,
+            cond_observation,
+            timesteps,
+            torch.zeros(1, model.action_horizon, model.action_dim),
+            target,
+            mask,
+            num_steps=4,
+            guidance_clip=5.0,
+            cfg_scale=cfg_scale,
+        )
+
+    v_plain = sample(plain)
+    v_advantage = sample(advantage)
+    v_mixed = sample(plain, cond_observation=advantage, cfg_scale=0.5)
+
+    torch.testing.assert_close(v_plain, torch.zeros_like(v_plain))
+    torch.testing.assert_close(v_advantage, -torch.ones_like(v_advantage))
+    torch.testing.assert_close(v_mixed, 0.5 * (v_plain + v_advantage))
+
+
+def test_rtc_denoise_loop_ignores_an_empty_overlap():
+    model = _BranchedVelocityPi0()
+    observation = _cfg_observation(0.5)
+    timesteps = rl_sampler.get_timesteps(4, torch.device("cpu"))
+    noise = torch.zeros(1, model.action_horizon, model.action_dim)
+    mask = torch.zeros(1, model.action_horizon, 1)
+
+    def sample(target):
+        return rtc_denoise_loop(
+            model,
+            observation,
+            None,
+            timesteps,
+            noise,
+            target,
+            mask,
+            num_steps=4,
+            guidance_clip=5.0,
+            cfg_scale=0.0,
+        )
+
+    guided = sample(torch.full((1, model.action_horizon, model.action_dim), 3.0))
+    unguided = sample(torch.zeros(1, model.action_horizon, model.action_dim))
+
+    assert torch.equal(guided, unguided)
+
+
+class _TensorVelocityPi0:
+    """Tensor-only stand-in for Pi0, so the loop traces into one graph."""
+
+    action_horizon = 2
+    action_dim = 2
+
+    def build_prefix_cache(self, observation):
+        prefix_mask = torch.ones(
+            1, 1, dtype=torch.bool, device=observation.state.device
+        )
+        return None, prefix_mask, observation.state[:, 0]
+
+    def run_suffix(self, observation, x_t, t_tensor, kv_cache, prefix_mask):
+        del observation, prefix_mask
+        return kv_cache[:, None, None] + torch.zeros_like(x_t) + t_tensor[:, None, None]
+
+    def velocity_from_suffix(self, suffix_out_act):
+        return suffix_out_act
+
+
+def _device_observation(branch: float, device: torch.device) -> Observation:
+    return Observation(
+        images={key: torch.zeros(1, 8, 8, 3, device=device) for key in IMAGE_KEYS},
+        image_masks={
+            key: torch.ones(1, dtype=torch.bool, device=device) for key in IMAGE_KEYS
+        },
+        state=torch.full((1, 1), branch, device=device),
+        tokenized_prompt=torch.zeros(1, 4, dtype=torch.long, device=device),
+        tokenized_prompt_mask=torch.ones(1, 4, dtype=torch.bool, device=device),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_loop_graph_sampler_matches_the_eager_loop():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        LoopGraphSampler,
+    )
+
+    device = torch.device("cuda")
+    model = _TensorVelocityPi0()
+    plain = _device_observation(0.0, device)
+    advantage = _device_observation(1.0, device)
+    timesteps = rl_sampler.get_timesteps(4, device)
+    noise = torch.zeros(1, model.action_horizon, model.action_dim, device=device)
+    target = torch.zeros(1, model.action_horizon, model.action_dim, device=device)
+    mask = torch.zeros(1, model.action_horizon, 1, device=device)
+
+    def sample(denoise_fn):
+        return denoise_fn(
+            model,
+            plain,
+            advantage,
+            timesteps,
+            noise,
+            target,
+            mask,
+            num_steps=4,
+            guidance_clip=5.0,
+            cfg_scale=0.5,
+        )
+
+    eager = sample(rtc_denoise_loop)
+    graph_sampler = LoopGraphSampler(rtc_denoise_loop)
+    captured = sample(graph_sampler)
+    replayed = sample(graph_sampler)
+
+    assert torch.equal(captured, eager)
+    assert torch.equal(replayed, eager)
+    assert replayed.data_ptr() != captured.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_euler_denoise_loop_replays_from_a_graph():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        LoopGraphSampler,
+    )
+
+    device = torch.device("cuda")
+    model = _TensorVelocityPi0()
+    plain = _device_observation(0.0, device)
+    advantage = _device_observation(1.0, device)
+    noise = torch.zeros(1, model.action_horizon, model.action_dim, device=device)
+
+    def sample(denoise_fn):
+        return denoise_fn(model, plain, advantage, noise, num_steps=4, cfg_scale=0.5)
+
+    eager = sample(euler_denoise_loop)
+    captured = sample(LoopGraphSampler(euler_denoise_loop))
+
+    assert torch.equal(captured, eager)
 
 
 def test_advantage_prompts_match_the_cfg_training_suffix():

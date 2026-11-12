@@ -26,7 +26,7 @@ from rlinf.models.embodiment.openpi.modules.model import (
     Observation,
     preprocess_observation,
 )
-from rlinf.models.embodiment.openpi.pi0 import Pi0
+from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
 from rlinf.utils.logging import get_logger
@@ -86,6 +86,9 @@ class Pi0Eval(EnvIO, Pi0):
         self.rtc_guidance_clip = rtc_guidance_clip
         self.cfgrl_guidance_scale = float(cfgrl_guidance_scale)
         self.guidance_type = guidance_type
+        # Both stay ``None`` (the eager loops) until enable_sampler_graph swaps
+        # in captured CUDA graphs.
+        self._rtc_denoise_fn = None
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
             "num_steps=%d rtc=%s mode=%s clip=%.2f",
@@ -152,6 +155,50 @@ class Pi0Eval(EnvIO, Pi0):
             cfg_scale=self.cfgrl_guidance_scale,
         )
 
+    def enable_sampler_graph(self) -> None:
+        """Serve both denoise loops from captured CUDA graphs.
+
+        A CUDA graph records the eager kernels, so the returned chunk stays
+        bit-identical to the eager loop and only the launch overhead goes away.
+        ``torch.compile`` was measured to drift by up to 1.7e-2 on a 50-step
+        chunk, which rules it out for a deployment that pins the numbers.
+
+        The plain bootstrap loop (:attr:`_plain_denoise_fn`) and the RTC replan
+        loop (:attr:`_rtc_denoise_fn`) are captured separately because they run
+        a different sequence of kernels. Shapes are pinned by the model config
+        and the camera layout, so changing ``max_token_len``,
+        ``num_action_chunks``, ``num_steps`` or the camera resolution
+        re-captures. Capture happens on the first call of each path, which the
+        server warmup covers.
+        """
+        from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+            LoopGraphSampler,
+            rtc_denoise_loop,
+        )
+
+        if not torch.cuda.is_available():
+            get_logger().warning(
+                "Pi0Eval: the RTC sampler needs CUDA to run from a captured "
+                "graph; keeping the eager loop"
+            )
+            return
+        self._plain_denoise_fn = LoopGraphSampler(euler_denoise_loop)
+        self._rtc_denoise_fn = LoopGraphSampler(rtc_denoise_loop)
+        get_logger().info(
+            "Pi0Eval: plain and RTC samplers run from captured CUDA graphs; "
+            "the first call of each captures it"
+        )
+
+    def disable_sampler_graph(self) -> None:
+        """Go back to the eager denoise loops."""
+        self._plain_denoise_fn = None
+        self._rtc_denoise_fn = None
+
+    @property
+    def sampler_graphed(self) -> bool:
+        """Whether the eval paths replay a captured graph."""
+        return self._plain_denoise_fn is not None or self._rtc_denoise_fn is not None
+
     def _guidance_observation(self, env_obs: dict[str, Any]) -> Observation | None:
         """Advantage-conditioned twin of the request, or ``None`` when CFG is off."""
         if self.cfgrl_guidance_scale == 0.0:
@@ -191,6 +238,7 @@ class Pi0Eval(EnvIO, Pi0):
             guidance_clip=self.rtc_guidance_clip,
             cond_observation=cond_observation,
             cfg_scale=self.cfgrl_guidance_scale,
+            denoise_fn=self._rtc_denoise_fn,
         )
         actions = self.decode_actions(model_actions, observation.state)
         B = actions.shape[0]

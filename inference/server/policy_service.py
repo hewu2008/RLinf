@@ -30,12 +30,19 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from inference.protocol import build_metadata, validate_rtc_payload
+from inference.protocol import (
+    RTC_PROTOCOL_VERSION,
+    build_metadata,
+    validate_rtc_payload,
+)
 from inference.server.obs_adapter import CAMERA_SLOTS, build_env_obs
 
 logger = logging.getLogger(__name__)
 
 WARMUP_IMAGE_SHAPE = (480, 640, 3)
+
+RTC_WARMUP_STEPS = 3
+"""Warmup replans; the first replan captures the RTC graph."""
 
 
 @dataclasses.dataclass
@@ -76,6 +83,21 @@ class PolicyService:
         )
 
         self._model = self._build_model(cfg)
+        if bool(OmegaConf.select(cfg, "openpi.graph_sampler", default=False)):
+            enable_graph = getattr(self._model, "enable_sampler_graph", None)
+            if enable_graph is None:
+                logger.warning(
+                    "openpi.graph_sampler is set but %s has no captured "
+                    "sampler; the RTC loop stays eager",
+                    type(self._model).__name__,
+                )
+            elif torch.cuda.is_available():
+                enable_graph()
+            else:
+                logger.warning(
+                    "openpi.graph_sampler is set but no CUDA device is "
+                    "available; the RTC sampler stays eager"
+                )
         self._cfg_scale = float(getattr(self._model, "cfgrl_guidance_scale", 0.0))
         self._guidance_type = getattr(self._model, "guidance_type", "off")
         chunk = getattr(self._model, "action_chunk", None) or self._model.action_horizon
@@ -118,12 +140,51 @@ class PolicyService:
             "state": np.zeros(self._action_dim, dtype=np.float32),
             "prompt": self._default_prompt or "warmup",
         }
+        try:
+            self._run_warmup(observation, steps)
+        except Exception:
+            if not getattr(self._model, "sampler_graphed", False):
+                raise
+            logger.exception(
+                "warmup failed with the captured sampler; "
+                "falling back to the eager loops"
+            )
+            self._model.disable_sampler_graph()
+            self._run_warmup(observation, steps)
+
+    def _run_warmup(self, observation: Mapping[str, Any], steps: int) -> None:
         session = RTCSession()
         for step in range(steps):
             start = time.monotonic()
             self.infer(observation, session)
             logger.info(
-                "warmup %d/%d done in %.1fs", step + 1, steps, time.monotonic() - start
+                "warmup bootstrap %d/%d done in %.1fs",
+                step + 1,
+                steps,
+                time.monotonic() - start,
+            )
+        if not self._rtc_enabled:
+            return
+        # The bootstrap above filled session.model_actions, so these requests
+        # take the guided replan path the robot drives in steady state.
+        replan = {
+            **observation,
+            "rtc": {
+                "version": RTC_PROTOCOL_VERSION,
+                "request_type": "replan",
+                "executed_horizon": 1,
+                "predicted_delay_steps": 0,
+                "chunk_id": 0,
+            },
+        }
+        for step in range(RTC_WARMUP_STEPS):
+            start = time.monotonic()
+            self.infer(replan, session)
+            logger.info(
+                "warmup replan %d/%d done in %.1fs",
+                step + 1,
+                RTC_WARMUP_STEPS,
+                time.monotonic() - start,
             )
 
     def infer(
@@ -137,6 +198,7 @@ class PolicyService:
             default_prompt=self._default_prompt,
             action_dim=self._action_dim,
         )
+        prepared = time.monotonic()
 
         rtc_context = None
         rtc_desc = "off"
@@ -157,12 +219,22 @@ class PolicyService:
         actions, result = self._model.predict_action_batch(
             env_obs=env_obs, mode="eval", rtc_context=rtc_context
         )
+        denoised = time.monotonic()
         model_actions = result.get("model_actions")
         if model_actions is not None:
             session.model_actions = model_actions.detach().to("cpu").contiguous()
         session.chunk_id = chunk_id
 
         chunk = actions.detach().to("cpu", dtype=torch.float32).numpy()[0]
+        decoded = time.monotonic()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "chunk %d timings: env_prep=%.3fs denoise=%.3fs decode=%.3fs",
+                chunk_id,
+                prepared - start,
+                denoised - prepared,
+                decoded - denoised,
+            )
         # CFG reuses one extra forward per denoise step, so log every guided
         # request; plain requests only show up under DEBUG.
         log = logger.info if self._cfg_scale > 0.0 else logger.debug

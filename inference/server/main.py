@@ -58,6 +58,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip the synthetic warmup requests",
     )
     parser.add_argument(
+        "--no-graph-sampler",
+        dest="graph_sampler",
+        action="store_false",
+        default=None,
+        help=(
+            "serve the RTC denoise loop eagerly instead of replaying a "
+            "captured CUDA graph (openpi.graph_sampler: false)"
+        ),
+    )
+    parser.add_argument(
         "--cfg-beta",
         type=float,
         default=None,
@@ -81,6 +91,8 @@ def apply_cli_overrides(cfg: DictConfig, args: argparse.Namespace) -> DictConfig
         cfg.openpi.rtc_enabled = args.rtc
     if args.warmup is not None:
         cfg.server.warmup = args.warmup
+    if args.graph_sampler is not None:
+        cfg.openpi.graph_sampler = args.graph_sampler
     if args.cfg_beta is not None:
         cfg.openpi.cfgrl_guidance_scale = float(args.cfg_beta)
     return cfg

@@ -21,7 +21,6 @@ subclasses (eval / RL / DAgger / DSRL) inherit this module.
 
 from __future__ import annotations
 
-import logging
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -35,7 +34,6 @@ from rlinf.models.embodiment.openpi.modules import gemma, model, pointnet, sigli
 from rlinf.models.embodiment.openpi.modules.utils import _str_to_dtype
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
-from rlinf.utils.logging import get_logger
 
 
 def make_attn_mask(input_mask: torch.Tensor, mask_ar: torch.Tensor) -> torch.Tensor:
@@ -86,6 +84,63 @@ def posemb_sincos(
     )
 
 
+def euler_denoise_loop(
+    pi0_model,
+    observation,
+    cond_observation,
+    noise: torch.Tensor,
+    *,
+    num_steps: int,
+    cfg_scale: float,
+) -> torch.Tensor:
+    """Euler integration of the flow field, one suffix pass per step.
+
+    Split out of :meth:`Pi0.sample_actions` so the loop can be replayed from a
+    CUDA graph: the step count and every shape are fixed by the caller, and the
+    loop never reads a tensor back to the host. Keep it that way - a host copy,
+    a ``.item()`` or a tensor-dependent ``if`` invalidates the capture.
+
+    Args:
+        pi0_model: the Pi0 model providing the prefix cache and suffix passes.
+        observation: prepared observation of the plain branch.
+        cond_observation: prepared advantage-conditioned observation, or
+            ``None`` to sample the plain branch alone.
+        noise: ``(B, action_horizon, action_dim)`` initial sample.
+        num_steps: number of Euler steps.
+        cfg_scale: guidance weight in ``(1 - cfg_scale) * v + cfg_scale *
+            v_cond``.
+    """
+    dt = -1.0 / num_steps
+    B = observation.state.shape[0]
+    device = observation.state.device
+
+    _, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
+    if cond_observation is not None:
+        _, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
+            cond_observation
+        )
+
+    x_t = noise
+    t = 1.0
+
+    while t >= -dt / 2:
+        t_tensor = torch.full((B,), t, device=device, dtype=torch.float32)
+        v_t = pi0_model.velocity_from_suffix(
+            pi0_model.run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask)
+        )
+        if cond_observation is not None:
+            v_t_cond = pi0_model.velocity_from_suffix(
+                pi0_model.run_suffix(
+                    cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
+                )
+            )
+            v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
+        x_t = x_t + dt * v_t
+        t = t + dt
+
+    return x_t
+
+
 class Pi0(model.BaseModel):
     """Pi0 flow-matching model: network assembly plus RLinf SFT forward."""
 
@@ -105,6 +160,9 @@ class Pi0(model.BaseModel):
         self.pcd = config.pcd
         self.embed_dtype = _str_to_dtype(config.dtype)
         self._config = config
+        # ``None`` keeps :func:`euler_denoise_loop`; Pi0Eval.enable_sampler_graph
+        # swaps in a captured CUDA graph for eval serving.
+        self._plain_denoise_fn = None
 
         paligemma_config = gemma.get_config(config.paligemma_variant)
         action_expert_config = gemma.get_config(config.action_expert_variant)
@@ -249,7 +307,10 @@ class Pi0(model.BaseModel):
 
         tokens = torch.cat(tokens, dim=1)
         input_mask = torch.cat(input_mask, dim=1)
-        ar_mask = torch.tensor(ar_mask, device=tokens.device)
+        # Every prefix token attends bidirectionally, so the autoregressive mask
+        # is all False. Building it on the device keeps the forward pass free of
+        # host-to-device copies, which a CUDA graph capture rejects.
+        ar_mask = torch.zeros(len(ar_mask), dtype=torch.bool, device=tokens.device)
         return tokens, input_mask, ar_mask
 
     def embed_suffix(
@@ -327,14 +388,11 @@ class Pi0(model.BaseModel):
         tokens = torch.cat(tokens, dim=1)
         input_mask = torch.cat(input_mask, dim=1)
 
-        # Build ar_mask with correct length matching input_mask.shape[1]
-        ar_mask = torch.zeros(
-            input_mask.shape[1], dtype=torch.bool, device=tokens.device
-        )
-        if not self.pi05:
-            ar_mask[:2] = True
-        else:
-            ar_mask[0] = True
+        # Build the autoregressive mask with a comparison rather than slice
+        # assignment: an indexed write to a bool tensor is not permitted while a
+        # CUDA graph captures the stream, and the mask is static anyway.
+        ar_count = 1 if self.pi05 else 2
+        ar_mask = torch.arange(input_mask.shape[1], device=tokens.device) < ar_count
 
         return tokens, input_mask, ar_mask, adarms_cond
 
@@ -554,7 +612,6 @@ class Pi0(model.BaseModel):
                 cond_observation, train=False
             )
 
-        dt = -1.0 / num_steps
         B = observation.state.shape[0]
         device = observation.state.device
 
@@ -563,46 +620,19 @@ class Pi0(model.BaseModel):
                 B, self.action_horizon, self.action_dim, device=device, generator=rng
             )
 
-        _, prefix_mask, kv_cache = self.build_prefix_cache(observation)
-        if cond_observation is not None:
-            _, cond_prefix_mask, cond_kv_cache = self.build_prefix_cache(
-                cond_observation
-            )
-
-        x_t = noise
-        t = 1.0
-        logger = get_logger()
-        log_guidance = logger.isEnabledFor(logging.DEBUG) and (
-            cond_observation is not None
+        denoise = (
+            euler_denoise_loop
+            if self._plain_denoise_fn is None
+            else self._plain_denoise_fn
         )
-
-        # Euler integration
-        while t >= -dt / 2:
-            t_tensor = torch.full((B,), t, device=device, dtype=torch.float32)
-            suffix_out_act = self.run_suffix(
-                observation, x_t, t_tensor, kv_cache, prefix_mask
-            )
-            v_t = self.velocity_from_suffix(suffix_out_act)
-            if cond_observation is not None:
-                cond_suffix_out_act = self.run_suffix(
-                    cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
-                )
-                v_t_cond = self.velocity_from_suffix(cond_suffix_out_act)
-                if log_guidance:
-                    logger.debug(
-                        "cfg step t=%.3f scale=%.3f |v|=%.4f |v_cond|=%.4f "
-                        "|v_cond-v|=%.4f",
-                        t,
-                        cfg_scale,
-                        v_t.float().norm().item(),
-                        v_t_cond.float().norm().item(),
-                        (v_t_cond.float() - v_t.float()).norm().item(),
-                    )
-                v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
-            x_t = x_t + dt * v_t
-            t = t + dt
-
-        return x_t
+        return denoise(
+            self,
+            observation,
+            cond_observation,
+            noise,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+        )
 
     def _init_rlinf_runtime(
         self,

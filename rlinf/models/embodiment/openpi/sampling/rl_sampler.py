@@ -36,14 +36,19 @@ def sample_mean_var(
     noise_level: float,
     num_steps: int,
     noise_std: torch.Tensor | None = None,
+    timesteps: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the ``(x_t_mean, x_t_std)`` pair for one denoise step.
 
     Matches ``OpenPi0ForRLActionPrediction.sample_mean_var_val``.
     ``noise_std`` is required when ``noise_method='flow_noise'`` (from ExploreNoiseNet).
+    ``timesteps`` lets a caller that walks the schedule one step at a time reuse
+    one schedule tensor instead of rebuilding it; ``None`` rebuilds it here.
     """
     device = x_t.device
-    timesteps = get_timesteps(num_steps, device).to(x_t.dtype)
+    if timesteps is None:
+        timesteps = get_timesteps(num_steps, device)
+    timesteps = timesteps.to(x_t.dtype)
     t_input = timesteps[idx][:, None, None].expand_as(x_t)
     delta = (timesteps[idx] - timesteps[idx + 1])[:, None, None].expand_as(x_t)
     x0_pred = x_t - v_t * t_input

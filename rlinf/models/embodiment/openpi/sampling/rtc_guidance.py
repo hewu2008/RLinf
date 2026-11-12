@@ -21,7 +21,8 @@ sampler; the Euler loop below is the vendored-Pi0 implementation.
 
 from __future__ import annotations
 
-import logging
+import dataclasses
+import functools
 import math
 from dataclasses import dataclass
 
@@ -29,7 +30,6 @@ import torch
 
 from rlinf.models.embodiment.openpi.modules.model import preprocess_observation
 from rlinf.models.embodiment.openpi.sampling import rl_sampler
-from rlinf.utils.logging import get_logger
 
 
 @dataclass
@@ -86,6 +86,200 @@ def build_rtc_target_and_mask(
     return target, mask
 
 
+def rtc_denoise_loop(
+    pi0_model,
+    observation,
+    cond_observation,
+    timesteps: torch.Tensor,
+    noise: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    num_steps: int,
+    guidance_clip: float,
+    cfg_scale: float,
+) -> torch.Tensor:
+    """Run the guided Euler loop and return the sampled chunk.
+
+    Split out of :func:`sample_actions_with_rtc_guidance` so the loop can be
+    replayed from a CUDA graph (:class:`RTCGraphSampler`): every input has a
+    shape that depends only on the model config (batch, ``action_horizon``,
+    ``action_dim``, prefix length), nothing synchronizes with the host, and
+    nothing branches on a tensor value. Keep it that way - a host copy, a
+    ``.item()`` or a tensor-dependent ``if`` invalidates the capture.
+
+    Args:
+        pi0_model: the Pi0 / Pi0Eval model providing the prefix cache and suffix
+            forward passes.
+        observation: prepared observation of the plain branch.
+        cond_observation: prepared advantage-conditioned observation, or
+            ``None`` to sample the plain branch alone.
+        timesteps: ``(num_steps + 1,)`` float tensor from
+            ``rl_sampler.get_timesteps``.
+        noise: ``(B, action_horizon, action_dim)`` initial sample.
+        target: overlap target, all zeros when there is no previous chunk.
+        mask: overlap mask, all zeros when there is no previous chunk.
+        num_steps: number of Euler steps.
+        guidance_clip: upper clamp of the overlap guidance scale.
+        cfg_scale: classifier-free guidance weight, applied as
+            ``(1 - cfg_scale) * v + cfg_scale * v_cond``.
+    """
+    B = observation.state.shape[0]
+    device = observation.state.device
+
+    prefix_out, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
+    del prefix_out
+    if cond_observation is not None:
+        cond_prefix_out, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
+            cond_observation
+        )
+        del cond_prefix_out
+
+    x_t = noise
+    # ``torch.zeros`` / ``torch.full`` fill on the device; ``torch.tensor(...,
+    # device=...)`` would copy host memory and abort a CUDA graph capture.
+    paper_tau = torch.zeros((), device=device, dtype=noise.dtype)
+    dt = torch.full((), 1.0 / num_steps, device=device, dtype=noise.dtype)
+    idx_step = torch.empty(B, device=device, dtype=torch.long)
+
+    for idx in range(num_steps):
+        t_tensor = timesteps[idx].repeat(B)
+        suffix_act = pi0_model.run_suffix(
+            observation, x_t, t_tensor, kv_cache, prefix_mask
+        )
+        v_t = pi0_model.velocity_from_suffix(suffix_act).to(torch.float32)
+        if cond_observation is not None:
+            cond_suffix_act = pi0_model.run_suffix(
+                cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
+            )
+            v_t_cond = pi0_model.velocity_from_suffix(cond_suffix_act).to(torch.float32)
+            v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
+        idx_step.fill_(idx)
+        x_t_mean, _ = rl_sampler.sample_mean_var(
+            x_t.to(torch.float32),
+            v_t,
+            idx_step,
+            noise_method="flow_ode",
+            noise_level=0.0,
+            num_steps=num_steps,
+            timesteps=timesteps,
+        )
+        # flow_ode has no step noise, so the guidance term is applied
+        # unconditionally and a request without a previous chunk passes an
+        # all-zero target and mask.
+        guidance_term = (target - x_t_mean) * mask
+        guidance_scale = torch.clamp(
+            (1.0 - paper_tau) / torch.clamp(paper_tau + 1e-4, min=1e-4),
+            max=float(guidance_clip),
+        )
+        x_t = x_t_mean + guidance_scale * guidance_term
+        paper_tau = paper_tau + dt
+    return x_t
+
+
+def _clone_tensors(node):
+    """Clone every tensor of a nested structure, leaving everything else as is."""
+    if torch.is_tensor(node):
+        return node.clone()
+    if dataclasses.is_dataclass(node):
+        return dataclasses.replace(
+            node,
+            **{
+                field.name: _clone_tensors(getattr(node, field.name))
+                for field in dataclasses.fields(node)
+            },
+        )
+    if isinstance(node, dict):
+        return {key: _clone_tensors(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_clone_tensors(value) for value in node]
+    if isinstance(node, tuple):
+        return tuple(_clone_tensors(value) for value in node)
+    return node
+
+
+def _copy_tensors_into(dst, src) -> bool:
+    """Copy ``src`` into the static ``dst`` in place; ``False`` on a layout change."""
+    if torch.is_tensor(dst):
+        if not torch.is_tensor(src) or dst.shape != src.shape or dst.dtype != src.dtype:
+            return False
+        dst.copy_(src)
+        return True
+    if dataclasses.is_dataclass(dst):
+        if not dataclasses.is_dataclass(src) or type(dst) is not type(src):
+            return False
+        return all(
+            _copy_tensors_into(getattr(dst, field.name), getattr(src, field.name))
+            for field in dataclasses.fields(dst)
+        )
+    if isinstance(dst, dict):
+        if not isinstance(src, dict) or dst.keys() != src.keys():
+            return False
+        return all(_copy_tensors_into(dst[key], src[key]) for key in dst)
+    if isinstance(dst, (list, tuple)):
+        if not isinstance(src, type(dst)) or len(dst) != len(src):
+            return False
+        return all(
+            _copy_tensors_into(dst_item, src_item)
+            for dst_item, src_item in zip(dst, src, strict=True)
+        )
+    if dst is None:
+        return src is None
+    return False
+
+
+class LoopGraphSampler:
+    """Serve a denoise loop from one captured CUDA graph.
+
+    The graph records the eager kernels, so a replay returns the same action
+    bits as the eager loop; what disappears is the per-step launch overhead,
+    which dominates a batch-of-one chunk. Inputs are copied into static buffers
+    that are kept alive for the lifetime of the sampler, so the caller may keep
+    the returned chunk without observing a later request overwrite it.
+
+    ``torch.compile`` would also remove the launches but reorders and refolds
+    the arithmetic (measured up to 1.7e-2 absolute drift on a 50-step chunk),
+    so it cannot serve a deployment that requires the eager numbers.
+
+    The shapes are pinned by the model config and the camera layout. A call
+    whose tensors differ from the captured ones re-captures, and the capture
+    must run on CUDA.
+
+    Any ``*args`` are the loop's tensor arguments; they are passed straight to
+    ``denoise_fn`` after the model, and keyword arguments are fixed at capture
+    time (they are Python scalars such as ``num_steps``).
+    """
+
+    def __init__(self, denoise_fn) -> None:
+        self._denoise_fn = denoise_fn
+        self._graph = None
+        self._buffers = None
+        self._output = None
+        self._kwargs = None
+
+    def __call__(self, pi0_model, *inputs, **kwargs) -> torch.Tensor:
+        if self._buffers is None or not _copy_tensors_into(self._buffers, inputs):
+            self._capture(pi0_model, inputs, kwargs)
+        self._graph.replay()
+        return self._output.clone()
+
+    def _capture(self, pi0_model, inputs: tuple, kwargs: dict) -> None:
+        self._kwargs = dict(kwargs)
+        self._buffers = tuple(_clone_tensors(item) for item in inputs)
+        run = functools.partial(
+            self._denoise_fn, pi0_model, *self._buffers, **self._kwargs
+        )
+        for _ in range(2):
+            run()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._output = run()
+        torch.cuda.synchronize()
+        self._graph = graph
+
+
 @torch.no_grad()
 def sample_actions_with_rtc_guidance(
     pi0_model,
@@ -98,12 +292,17 @@ def sample_actions_with_rtc_guidance(
     guidance_clip: float = 5.0,
     cond_observation=None,
     cfg_scale: float = 0.0,
+    denoise_fn=None,
 ) -> torch.Tensor:
     """Euler ODE sampling with overlap guidance against the previous chunk.
 
     ``cond_observation`` enables classifier-free guidance: each step's velocity
     becomes ``(1 - cfg_scale) * v + cfg_scale * v_cond``, with the overlap term
     applied to the mixed velocity.
+
+    ``denoise_fn`` replaces :func:`rtc_denoise_loop`, which is how a caller
+    serves a compiled loop; it receives the same positional arguments and the
+    same keyword arguments.
     """
     observation = preprocess_observation(observation, train=False)
     if cond_observation is not None:
@@ -123,13 +322,7 @@ def sample_actions_with_rtc_guidance(
     else:
         noise = noise.to(device=device, dtype=torch.float32)
 
-    prefix_out, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
-    del prefix_out
-    if cond_observation is not None:
-        cond_prefix_out, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
-            cond_observation
-        )
-        del cond_prefix_out
+    timesteps = rl_sampler.get_timesteps(num_steps, device).to(noise.dtype)
 
     prev_remaining = (
         rtc_context.get_prev_remaining() if rtc_context is not None else None
@@ -143,54 +336,16 @@ def sample_actions_with_rtc_guidance(
         dtype=noise.dtype,
     )
 
-    x_t = noise
-    paper_tau = torch.tensor(0.0, device=device, dtype=noise.dtype)
-    dt = torch.tensor(1.0 / num_steps, device=device, dtype=noise.dtype)
-    idx_step = torch.empty(B, device=device, dtype=torch.long)
-    logger = get_logger()
-    log_guidance = logger.isEnabledFor(logging.DEBUG) and cond_observation is not None
-
-    for idx in range(num_steps):
-        t_val = float(rl_sampler.get_timesteps(num_steps, device)[idx].item())
-        t_tensor = torch.full((B,), t_val, device=device, dtype=torch.float32)
-        suffix_act = pi0_model.run_suffix(
-            observation, x_t, t_tensor, kv_cache, prefix_mask
-        )
-        v_t = pi0_model.velocity_from_suffix(suffix_act).to(torch.float32)
-        if cond_observation is not None:
-            cond_suffix_act = pi0_model.run_suffix(
-                cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
-            )
-            v_t_cond = pi0_model.velocity_from_suffix(cond_suffix_act).to(torch.float32)
-            if log_guidance:
-                logger.debug(
-                    "cfg step t=%.3f scale=%.3f |v|=%.4f |v_cond|=%.4f |v_cond-v|=%.4f",
-                    t_val,
-                    cfg_scale,
-                    v_t.norm().item(),
-                    v_t_cond.norm().item(),
-                    (v_t_cond - v_t).norm().item(),
-                )
-            v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
-        idx_step.fill_(idx)
-        x_t_mean, x_t_std = rl_sampler.sample_mean_var(
-            x_t.to(torch.float32),
-            v_t,
-            idx_step,
-            noise_method="flow_ode",
-            noise_level=0.0,
-            num_steps=num_steps,
-        )
-        if prev_remaining is not None and prev_remaining.numel() > 0:
-            guidance_term = (target - x_t_mean) * mask
-            guidance_scale = torch.clamp(
-                (1.0 - paper_tau) / torch.clamp(paper_tau + 1e-4, min=1e-4),
-                max=float(guidance_clip),
-            )
-            x_t_mean = x_t_mean + guidance_scale * guidance_term
-        step_noise = torch.randn(
-            x_t.shape, device=device, dtype=torch.float32, generator=rng
-        )
-        x_t = x_t_mean + step_noise * x_t_std
-        paper_tau = paper_tau + dt
-    return x_t
+    run_denoise = rtc_denoise_loop if denoise_fn is None else denoise_fn
+    return run_denoise(
+        pi0_model,
+        observation,
+        cond_observation,
+        timesteps,
+        noise,
+        target,
+        mask,
+        num_steps=num_steps,
+        guidance_clip=guidance_clip,
+        cfg_scale=cfg_scale,
+    )

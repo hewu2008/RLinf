@@ -364,11 +364,10 @@ class Attention(nn.Module):
         # We need mask to be (B, 1, 1, T, S) so it broadcasts to (B, K, G, T, S)
         big_neg = -2.3819763e38
         mask_for_logits = attn_mask[:, :, None, :, :].expand_as(logits).bool()
-        masked_logits = torch.where(
-            mask_for_logits,
-            logits,
-            torch.tensor(big_neg, dtype=logits.dtype, device=logits.device),
-        )
+        # ``masked_fill`` takes the filler as a kernel argument; building it with
+        # ``torch.tensor(..., device=...)`` would copy host memory and abort a
+        # CUDA graph capture.
+        masked_logits = logits.masked_fill(~mask_for_logits, big_neg)
 
         probs = F.softmax(masked_logits, dim=-1).to(dtype)
 
@@ -623,9 +622,11 @@ class Module(nn.Module):
         if kv_cache is None:
             layer_kv_caches = [None] * len(self.layers)
         else:
+            # A tuple spelling keeps torch.compile from tracing the ``list |
+            # tuple`` union type, which dynamo rejects as a sourceless type.
             layer_kv_caches = (
                 list(kv_cache)
-                if isinstance(kv_cache, list | tuple)
+                if isinstance(kv_cache, (list, tuple))
                 else [kv_cache] * len(self.layers)
             )
 

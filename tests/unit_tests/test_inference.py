@@ -332,6 +332,28 @@ def test_server_cli_overrides_the_cfg_scale():
     assert untouched.openpi.rtc_enabled is True
 
 
+def test_server_cli_disables_graph_sampler():
+    from omegaconf import OmegaConf
+
+    from inference.server.main import apply_cli_overrides, parse_args
+
+    def load():
+        return OmegaConf.create(
+            {
+                "openpi": {"graph_sampler": True},
+                "server": {"host": "0.0.0.0", "port": 55555},
+            }
+        )
+
+    off = apply_cli_overrides(
+        load(), parse_args(["--config", "server.yaml", "--no-graph-sampler"])
+    )
+    assert off.openpi.graph_sampler is False
+
+    untouched = apply_cli_overrides(load(), parse_args(["--config", "server.yaml"]))
+    assert untouched.openpi.graph_sampler is True
+
+
 def test_websocket_server_serves_chunks_and_forwards_tracebacks():
     pytest.importorskip("msgpack")
     pytest.importorskip("websockets")

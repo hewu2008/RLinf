@@ -23,8 +23,9 @@
 #
 # The first argument is the config; every later argument reaches
 # `inference.server.main` (--host, --port, --default-prompt, --no-rtc,
-# --no-warmup, --cfg-beta). A leading option skips the config, so
-# `bash scripts/run_inference_server.sh --no-rtc` keeps the config named below.
+# --no-warmup, --no-graph-sampler, --cfg-beta). A leading option skips the
+# config, so `bash scripts/run_inference_server.sh --no-rtc` keeps the config
+# named below.
 # HOST and PORT are shorthand for --host/--port, and
 # scripts/run_open_loop_eval.sh reads the same two variables, so one
 # `PORT=...` covers both sides.

@@ -37,11 +37,18 @@ openpi:
   # Classifier-free guidance: every denoise step mixes the plain-prompt branch
   # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the
   # conditioned prompt appends "\nAdvantage: <guidance_type>" as in training.
-  # 0.0 samples the plain prompt (one forward per step), 1.0 the conditioned
-  # branch alone; both cost an extra forward per step. --cfg-beta overrides it.
-  # Per-denoise-step guidance norms are logged at RLINF_LOG_LEVEL=DEBUG.
+  # 0.0 samples the plain prompt, 1.0 the conditioned branch alone; any other
+  # value keeps both branches in the denoise loop, and 1.5 extrapolates past the
+  # conditioned branch with a -0.5 weight on the plain one. --cfg-beta overrides
+  # it. Per-denoise-step guidance norms are logged at RLINF_LOG_LEVEL=DEBUG.
   cfgrl_guidance_scale: 1.5
   guidance_type: positive
+  # Serve the RTC denoise loop from a captured CUDA graph: one replay per
+  # chunk instead of thousands of kernel launches, with the eager numbers kept
+  # bit for bit. The graph is captured at the shapes the config pins, so
+  # changing max_token_len, num_action_chunks or the camera resolution
+  # re-captures it. --no-graph-sampler serves the loop eagerly.
+  graph_sampler: true
 
 openpi_data:
   norm_stats_path: /data/4T-1/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi/zerith/norm_stats.json
