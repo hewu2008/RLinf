@@ -1521,17 +1521,20 @@ def _cfg_observation(branch: float) -> Observation:
 
 
 class _BranchedVelocityPi0:
-    """Stand-in Pi0 whose velocity is the observation's ``state[0, 0]``."""
+    """Stand-in Pi0 whose per-branch velocity is carried in the prefix cache."""
 
     action_horizon = 2
     action_dim = 2
     _plain_denoise_fn = None
 
     def build_prefix_cache(self, observation):
-        return None, torch.ones(1, 1, dtype=torch.bool), float(observation.state[0, 0])
+        value = observation.state[:, 0].reshape(-1, 1, 1, 1)
+        return None, torch.ones(1, 1, dtype=torch.bool), ((value, value),)
 
     def run_suffix(self, observation, x_t, t_tensor, kv_cache, prefix_mask):
-        return torch.full_like(x_t, kv_cache)
+        del observation, prefix_mask
+        value = kv_cache[0][0].reshape(-1, 1, 1).to(x_t.dtype)
+        return value + torch.zeros_like(x_t)
 
     def velocity_from_suffix(self, suffix_out_act):
         return suffix_out_act
@@ -1614,6 +1617,107 @@ def test_rtc_denoise_loop_matches_the_cfg_mix():
     torch.testing.assert_close(v_mixed, 0.5 * (v_plain + v_advantage))
 
 
+def test_rtc_denoise_loop_batches_the_cfg_branches():
+    """One suffix pass per step serves both branches when CFG is on."""
+    model = _BranchedVelocityPi0()
+    shapes = []
+    real_run_suffix = model.run_suffix
+
+    def counting_run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask):
+        shapes.append(
+            (
+                x_t.shape[0],
+                t_tensor.shape[0],
+                prefix_mask.shape[0],
+                kv_cache[0][0].shape[0],
+            )
+        )
+        return real_run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask)
+
+    model.run_suffix = counting_run_suffix
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    timesteps = rl_sampler.get_timesteps(4, torch.device("cpu"))
+    target = torch.zeros(1, model.action_horizon, model.action_dim)
+    mask = torch.zeros(1, model.action_horizon, 1)
+
+    def sample(cond_observation=None):
+        shapes.clear()
+        actions = rtc_denoise_loop(
+            model,
+            plain,
+            cond_observation,
+            timesteps,
+            torch.zeros(1, model.action_horizon, model.action_dim),
+            target,
+            mask,
+            num_steps=4,
+            guidance_clip=5.0,
+            cfg_scale=0.5,
+        )
+        return actions, list(shapes)
+
+    guided, guided_shapes = sample(advantage)
+    plain_only, plain_shapes = sample()
+
+    assert guided_shapes == [(2, 2, 2, 2)] * 4
+    assert plain_shapes == [(1, 1, 1, 1)] * 4
+    torch.testing.assert_close(
+        guided, 0.5 * (plain_only + _sample_advantage(advantage))
+    )
+
+
+def _sample_advantage(observation):
+    """Sample the plain loop on a single observation, for the mixture check."""
+    model = _BranchedVelocityPi0()
+    timesteps = rl_sampler.get_timesteps(4, torch.device("cpu"))
+    return rtc_denoise_loop(
+        model,
+        observation,
+        None,
+        timesteps,
+        torch.zeros(1, model.action_horizon, model.action_dim),
+        torch.zeros(1, model.action_horizon, model.action_dim),
+        torch.zeros(1, model.action_horizon, 1),
+        num_steps=4,
+        guidance_clip=5.0,
+        cfg_scale=0.0,
+    )
+
+
+def test_stack_branches_keeps_each_branch_mask_and_cache():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import _stack_branches
+
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    plain_mask = torch.tensor([[True, True, False]])
+    cond_mask = torch.tensor([[True, True, True]])
+    plain_cache = ((torch.zeros(1, 3, 1, 1), torch.zeros(1, 3, 1, 1)),)
+    cond_cache = ((torch.ones(1, 3, 1, 1), torch.ones(1, 3, 1, 1)),)
+
+    observation, mask, cache = _stack_branches(
+        plain, advantage, plain_mask, cond_mask, plain_cache, cond_cache
+    )
+
+    assert observation.state.tolist() == [[0.0], [1.0]]
+    assert mask.tolist() == [[True, True, False], [True, True, True]]
+    assert cache[0][0].shape[0] == 2
+    assert cache[0][0][0].abs().sum() == 0 and cache[0][0][1].abs().sum() == 3
+
+
+def test_stack_branches_rejects_unequal_prefix_lengths():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import _stack_branches
+
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    plain_cache = ((torch.zeros(1, 3, 1, 1), torch.zeros(1, 3, 1, 1)),)
+    cond_cache = ((torch.zeros(1, 5, 1, 1), torch.zeros(1, 5, 1, 1)),)
+
+    with pytest.raises(ValueError, match="equally long prefixes"):
+        _stack_branches(plain, advantage, mask, mask, plain_cache, cond_cache)
+
+
 def test_rtc_denoise_loop_ignores_an_empty_overlap():
     model = _BranchedVelocityPi0()
     observation = _cfg_observation(0.5)
@@ -1642,7 +1746,11 @@ def test_rtc_denoise_loop_ignores_an_empty_overlap():
 
 
 class _TensorVelocityPi0:
-    """Tensor-only stand-in for Pi0, so the loop traces into one graph."""
+    """Tensor-only stand-in for Pi0, so the loop traces into one graph.
+
+    The branch identity rides in the prefix cache, which is what the batched
+    CFG path concatenates.
+    """
 
     action_horizon = 2
     action_dim = 2
@@ -1651,11 +1759,13 @@ class _TensorVelocityPi0:
         prefix_mask = torch.ones(
             1, 1, dtype=torch.bool, device=observation.state.device
         )
-        return None, prefix_mask, observation.state[:, 0]
+        value = observation.state[:, 0].reshape(1, 1, 1, 1)
+        return None, prefix_mask, ((value, value),)
 
     def run_suffix(self, observation, x_t, t_tensor, kv_cache, prefix_mask):
         del observation, prefix_mask
-        return kv_cache[:, None, None] + torch.zeros_like(x_t) + t_tensor[:, None, None]
+        value = kv_cache[0][0].reshape(-1, 1, 1)
+        return value + torch.zeros_like(x_t) + t_tensor[:, None, None]
 
     def velocity_from_suffix(self, suffix_out_act):
         return suffix_out_act
