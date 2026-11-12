@@ -232,19 +232,20 @@ def test_open_loop_replays_only_frames_with_a_full_recorded_horizon():
         def infer(self, observation) -> dict:
             return {"actions": np.zeros((horizon, ACTION_DIM), np.float32)}
 
-    def _run(dataset: _Dataset) -> dict:
+    def _run(dataset: _Dataset, compare_horizon: int | None = None) -> dict:
         return evaluate_episode(
             _Client(),
             dataset,
             0,
             action_horizon=horizon,
             action_dim=ACTION_DIM,
-            chunk_stride=horizon,
+            chunk_stride=compare_horizon or horizon,
             max_chunks=0,
             prompt=None,
             camera_names=DEFAULT_CAMERAS,
             jpeg_quality=90,
             raw_images=True,
+            compare_horizon=compare_horizon,
         )
 
     dataset = _Dataset(length=10)
@@ -256,6 +257,13 @@ def test_open_loop_replays_only_frames_with_a_full_recorded_horizon():
     short = _Dataset(length=2)
     _run(short)
     assert short.requested == [0]
+
+    # A shorter window is compared (and stepped) like the JAX eval's
+    # --action_horizon, while every request still returns the full chunk.
+    window = _Dataset(length=10)
+    result = _run(window, compare_horizon=2)
+    assert window.requested == [0, 2, 4, 6, 8]
+    assert result["gt"].shape == (5 * 2, ACTION_DIM)
 
 
 def test_h1_client_resolves_camera_aliases_and_sdk_motor_replies():

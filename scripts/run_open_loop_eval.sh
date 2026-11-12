@@ -14,7 +14,12 @@
 # Usage (from the repository root):
 #   bash scripts/run_open_loop_eval.sh
 #   TRAJ_IDS="0 1" MAX_CHUNKS=240 bash scripts/run_open_loop_eval.sh
+#   ACTION_HORIZON=30 bash scripts/run_open_loop_eval.sh
 #   SAVE_PLOT_DIR= bash scripts/run_open_loop_eval.sh --raw-images
+#
+# ACTION_HORIZON is how many steps of each returned chunk are compared with the
+# record (and the default request stride), the same knob as `--action_horizon`
+# in ZERITH_Pi_OPEN/scripts/open_loop_eval.py; unset means the whole chunk.
 #
 # Extra arguments are forwarded to the python entry point. Leave PROMPT empty to
 # let the client use each sample's task, then the server default_prompt.
@@ -27,6 +32,7 @@ DATA_PATH=${DATA_PATH:-/data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask
 TRAJ_IDS=${TRAJ_IDS:-"0 1 2 3"}
 MAX_CHUNKS=${MAX_CHUNKS:-240}
 CHUNK_STRIDE=${CHUNK_STRIDE:-}
+ACTION_HORIZON=${ACTION_HORIZON:-30}
 # Empty values are meaningful: PROMPT= falls back to each sample's task and
 # SAVE_PLOT_DIR= skips the plots, so these two use "-" (unset only), not ":-".
 PROMPT=${PROMPT-"Sort all objects into the correct bins using both arms"}
@@ -50,6 +56,7 @@ args=(
 	--camera-names "${camera_array[@]}"
 )
 if [ -n "${CHUNK_STRIDE}" ]; then args+=(--chunk-stride "${CHUNK_STRIDE}"); fi
+if [ -n "${ACTION_HORIZON}" ]; then args+=(--action-horizon "${ACTION_HORIZON}"); fi
 if [ -n "${PROMPT}" ]; then args+=(--prompt "${PROMPT}"); fi
 if [ -n "${SAVE_PLOT_DIR}" ]; then args+=(--save-plot-dir "${SAVE_PLOT_DIR}"); fi
 

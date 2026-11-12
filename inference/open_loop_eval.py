@@ -84,7 +84,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--chunk-stride",
         type=int,
         default=None,
-        help="frames between two requests; defaults to the server action horizon",
+        help="frames between two requests; defaults to --action-horizon",
+    )
+    parser.add_argument(
+        "--action-horizon",
+        type=int,
+        default=None,
+        help=(
+            "steps of each returned chunk compared with the record, and the "
+            "default request stride; defaults to the server action horizon"
+        ),
     )
     parser.add_argument(
         "--prompt",
@@ -198,6 +207,7 @@ def evaluate_episode(
     camera_names: Sequence[str],
     jpeg_quality: int,
     raw_images: bool,
+    compare_horizon: int | None = None,
 ) -> dict[str, Any]:
     """Replay one episode and compare every predicted chunk with the record."""
     start, end = _episode_range(dataset, episode)
@@ -206,15 +216,20 @@ def evaluate_episode(
     latencies: list[float] = []
 
     # A recorded chunk that runs past the episode end is padded with the
-    # boundary frame, so only frames with a full horizon are replayed.
-    last_full = end - action_horizon
+    # boundary frame, so only frames with a full window are replayed.
+    steps = int(compare_horizon or action_horizon)
+    if not 0 < steps <= action_horizon:
+        raise ValueError(
+            f"compare_horizon must be in [1, {action_horizon}], got {steps}"
+        )
+    last_full = end - steps
     if last_full < start:
         logger.warning(
             "episode %d has %d frames, shorter than the %d-step horizon; its "
             "recorded chunk is padded and the error includes that tail",
             episode,
             end - start,
-            action_horizon,
+            steps,
         )
         request_frames = [start]
     else:
@@ -251,7 +266,7 @@ def evaluate_episode(
         if recorded.ndim == 1:
             recorded = recorded[np.newaxis]
 
-        frames = min(len(recorded), len(prediction), action_horizon)
+        frames = min(len(recorded), len(prediction), steps)
         gt_chunks.append(recorded[:frames])
         pred_chunks.append(prediction[:frames])
         logger.info(
@@ -385,10 +400,19 @@ def main(argv: list[str] | None = None) -> None:
         metadata = client.validate(require_rtc=False)
         action_horizon = int(metadata["action_horizon"])
         action_dim = int(metadata["action_dim"])
+        compare_horizon = args.action_horizon or action_horizon
+        if compare_horizon > action_horizon:
+            raise ValueError(
+                f"--action-horizon {compare_horizon} exceeds the server action "
+                f"horizon {action_horizon}; the server cannot return that many steps"
+            )
         logger.info("server metadata: %s", metadata)
 
         _, dataset = load_dataset(args.data_path, action_horizon)
-        stride = args.chunk_stride or action_horizon
+        stride = args.chunk_stride or compare_horizon
+        logger.info(
+            "comparing %d of %d steps per chunk", compare_horizon, action_horizon
+        )
 
         results = []
         for episode in args.traj_ids:
@@ -412,6 +436,7 @@ def main(argv: list[str] | None = None) -> None:
                     camera_names=args.camera_names,
                     jpeg_quality=args.jpeg_quality,
                     raw_images=args.raw_images,
+                    compare_horizon=compare_horizon,
                 )
             )
 
