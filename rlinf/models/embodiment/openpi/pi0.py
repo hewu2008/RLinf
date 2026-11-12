@@ -34,6 +34,9 @@ from rlinf.models.embodiment.openpi.modules import gemma, model, pointnet, sigli
 from rlinf.models.embodiment.openpi.modules.utils import _str_to_dtype
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
+from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+    stack_cfg_branches,
+)
 
 
 def make_attn_mask(input_mask: torch.Tensor, mask_ar: torch.Tensor) -> torch.Tensor:
@@ -100,6 +103,10 @@ def euler_denoise_loop(
     loop never reads a tensor back to the host. Keep it that way - a host copy,
     a ``.item()`` or a tensor-dependent ``if`` invalidates the capture.
 
+    With a conditioned branch both CFG branches are sampled by one suffix pass
+    over a doubled batch (:func:`stack_cfg_branches`); see
+    :func:`rtc_denoise_loop` for why that is the cheapest axis here.
+
     Args:
         pi0_model: the Pi0 model providing the prefix cache and suffix passes.
         observation: prepared observation of the plain branch.
@@ -115,26 +122,33 @@ def euler_denoise_loop(
     device = observation.state.device
 
     _, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
+    branches = 1
     if cond_observation is not None:
         _, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
             cond_observation
         )
+        observation, prefix_mask, kv_cache = stack_cfg_branches(
+            observation,
+            cond_observation,
+            prefix_mask,
+            cond_prefix_mask,
+            kv_cache,
+            cond_kv_cache,
+        )
+        branches = 2
 
     x_t = noise
     t = 1.0
 
     while t >= -dt / 2:
-        t_tensor = torch.full((B,), t, device=device, dtype=torch.float32)
+        t_tensor = torch.full((B * branches,), t, device=device, dtype=torch.float32)
         v_t = pi0_model.velocity_from_suffix(
-            pi0_model.run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask)
-        )
-        if cond_observation is not None:
-            v_t_cond = pi0_model.velocity_from_suffix(
-                pi0_model.run_suffix(
-                    cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
-                )
+            pi0_model.run_suffix(
+                observation, x_t.repeat(branches, 1, 1), t_tensor, kv_cache, prefix_mask
             )
-            v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
+        )
+        if branches == 2:
+            v_t = (1.0 - cfg_scale) * v_t[:B] + cfg_scale * v_t[B:]
         x_t = x_t + dt * v_t
         t = t + dt
 

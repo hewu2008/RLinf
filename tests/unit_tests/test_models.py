@@ -1685,8 +1685,38 @@ def _sample_advantage(observation):
     )
 
 
-def test_stack_branches_keeps_each_branch_mask_and_cache():
-    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import _stack_branches
+def test_plain_euler_loop_batches_the_cfg_branches():
+    """``rtc=off`` requests mix the branches in one suffix pass as well."""
+    model = _BranchedVelocityPi0()
+    shapes = []
+    real_run_suffix = model.run_suffix
+
+    def counting_run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask):
+        shapes.append((x_t.shape[0], t_tensor.shape[0], prefix_mask.shape[0]))
+        return real_run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask)
+
+    model.run_suffix = counting_run_suffix
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    noise = torch.zeros(1, model.action_horizon, model.action_dim)
+
+    Pi0.sample_actions(
+        model,
+        plain,
+        num_steps=4,
+        noise=noise,
+        cond_observation=advantage,
+        cfg_scale=0.5,
+    )
+    assert shapes == [(2, 2, 2)] * 4
+
+    shapes.clear()
+    Pi0.sample_actions(model, plain, num_steps=4, noise=noise)
+    assert shapes == [(1, 1, 1)] * 4
+
+
+def test_stack_cfg_branches_keeps_each_branch_mask_and_cache():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import stack_cfg_branches
 
     plain = _cfg_observation(0.0)
     advantage = _cfg_observation(1.0)
@@ -1695,7 +1725,7 @@ def test_stack_branches_keeps_each_branch_mask_and_cache():
     plain_cache = ((torch.zeros(1, 3, 1, 1), torch.zeros(1, 3, 1, 1)),)
     cond_cache = ((torch.ones(1, 3, 1, 1), torch.ones(1, 3, 1, 1)),)
 
-    observation, mask, cache = _stack_branches(
+    observation, mask, cache = stack_cfg_branches(
         plain, advantage, plain_mask, cond_mask, plain_cache, cond_cache
     )
 
@@ -1705,8 +1735,8 @@ def test_stack_branches_keeps_each_branch_mask_and_cache():
     assert cache[0][0][0].abs().sum() == 0 and cache[0][0][1].abs().sum() == 3
 
 
-def test_stack_branches_rejects_unequal_prefix_lengths():
-    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import _stack_branches
+def test_stack_cfg_branches_rejects_unequal_prefix_lengths():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import stack_cfg_branches
 
     plain = _cfg_observation(0.0)
     advantage = _cfg_observation(1.0)
@@ -1715,7 +1745,7 @@ def test_stack_branches_rejects_unequal_prefix_lengths():
     cond_cache = ((torch.zeros(1, 5, 1, 1), torch.zeros(1, 5, 1, 1)),)
 
     with pytest.raises(ValueError, match="equally long prefixes"):
-        _stack_branches(plain, advantage, mask, mask, plain_cache, cond_cache)
+        stack_cfg_branches(plain, advantage, mask, mask, plain_cache, cond_cache)
 
 
 def test_rtc_denoise_loop_ignores_an_empty_overlap():

@@ -140,7 +140,7 @@ def rtc_denoise_loop(
             cond_observation
         )
         del cond_prefix_out
-        observation, prefix_mask, kv_cache = _stack_branches(
+        observation, prefix_mask, kv_cache = stack_cfg_branches(
             observation,
             cond_observation,
             prefix_mask,
@@ -189,7 +189,7 @@ def rtc_denoise_loop(
     return x_t
 
 
-def _stack_branches(
+def stack_cfg_branches(
     observation,
     cond_observation,
     prefix_mask: torch.Tensor,
@@ -199,12 +199,13 @@ def _stack_branches(
 ) -> tuple:
     """Stack the two CFG branches on the batch axis for a single suffix pass.
 
-    Both branches share ``x_t``, so one pass with batch ``2B`` computes exactly
-    what two passes with batch ``B`` did, per sample: each sample keeps its own
-    prefix KV and its own mask. What changes is the launch count and the ``M`` of
-    every skinny GEMM, which is where a suffix step spends its time (measured
-    1.7x on a 50-token step). Returns the batched observation, prefix mask and
-    cache, plain branch first.
+    Shared by both denoise loops. Both branches share ``x_t``, so one pass with
+    batch ``2B`` computes exactly what two passes with batch ``B`` did, per
+    sample: each sample keeps its own prefix KV and its own mask. What changes is
+    the launch count and the ``M`` of every skinny GEMM, which is where a suffix
+    step spends its time (measured 1.7x on a 50-token step, 17% of a request on
+    the deployed Pi0.5). Returns the batched observation, prefix mask and cache,
+    plain branch first.
 
     ``run_suffix`` reads only ``state`` from the observation -- the images and
     the prompt reach the model exclusively through the prefix cache -- so the
@@ -356,8 +357,8 @@ def sample_actions_with_rtc_guidance(
     ``cond_observation`` enables classifier-free guidance: each step's velocity
     becomes ``(1 - cfg_scale) * v + cfg_scale * v_cond``, with the overlap term
     applied to the mixed velocity. Both branches are sampled by one suffix pass
-    over a doubled batch (:func:`_stack_branches`), which is where a suffix step
-    spends its time; the per-sample math is unchanged.
+    over a doubled batch (:func:`stack_cfg_branches`), which is where a suffix
+    step spends its time; the per-sample math is unchanged.
 
     ``denoise_fn`` replaces :func:`rtc_denoise_loop`, which is how a caller
     serves a compiled loop; it receives the same positional arguments and the
