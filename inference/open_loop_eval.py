@@ -20,7 +20,7 @@ chunk is compared with the recorded chunk that starts at that frame. Requests
 carry no ``rtc`` block, so the server takes its plain path and no chunk
 bookkeeping is involved.
 
-Run it from the repository root while ``inference/run_server.sh`` is up::
+Run it from the repository root while ``scripts/run_inference_server.sh`` is up::
 
     python -m inference.open_loop_eval \\
         --data-path /data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask \\

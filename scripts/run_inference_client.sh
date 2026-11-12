@@ -8,13 +8,14 @@
 # --no-rtc to run whole chunks without guidance.
 #
 # This side needs only inference/ plus the H1 vendor SDK, so it runs from the
-# robot's own venv: ROBOT_PYTHON=/path/to/python bash inference/run_client.sh
+# robot's own venv, launched from the repository root:
+#   ROBOT_PYTHON=/path/to/python bash scripts/run_inference_client.sh
 # Point H1_SDK_DIR (or --sdk_dir) at the directory holding lib_h1_sdk_python and
 # camera_client; without either, client/lib is used.
 # Client deps: pip install -r inference/requirements.txt
 #
 # HOST and PORT say where the policy server listens; they must match how it was
-# started (inference/run_server.sh reads the same two variables).
+# started (scripts/run_inference_server.sh reads the same two variables).
 #
 # prompt1: Pick and place the door handle into the left bin and the L-shaped bent pipe into the right bin
 # hdf5: 002e81207a19441bae7f4653ad759d7c

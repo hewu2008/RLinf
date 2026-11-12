@@ -17,14 +17,14 @@
 # and then set model_path / openpi_data.norm_stats_path in the config.
 #
 # Usage (from the repository root):
-#   bash inference/run_server.sh                     # the config named below
-#   bash inference/run_server.sh <config.yaml> --no-rtc
-#   PORT=60000 bash inference/run_server.sh          # bind another port
+#   bash scripts/run_inference_server.sh                     # the config named below
+#   bash scripts/run_inference_server.sh <config.yaml> --no-rtc
+#   PORT=60000 bash scripts/run_inference_server.sh          # bind another port
 #
 # The first argument is the config; every later argument reaches
 # `inference.server.main` (--host, --port, --default-prompt, --no-rtc,
 # --no-warmup). A leading option skips the config, so
-# `bash inference/run_server.sh --no-rtc` keeps the config named below.
+# `bash scripts/run_inference_server.sh --no-rtc` keeps the config named below.
 # HOST and PORT are shorthand for --host/--port, and
 # scripts/run_open_loop_eval.sh reads the same two variables, so one
 # `PORT=...` covers both sides.

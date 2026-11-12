@@ -3,10 +3,11 @@
 # dataset: every request replays one dataset frame through the same websocket
 # path the robot uses (JPEG camera frames + raw joint state) and compares the
 # returned action chunk with the record. No checkpoint is loaded locally, so
-# start inference/run_server.sh first.
+# start scripts/run_inference_server.sh first.
 #
 # Every request omits the RTC block, so this checks the plain chunk path only;
-# the guidance that inference/run_client.sh relies on is not exercised here.
+# the guidance that scripts/run_inference_client.sh relies on is not exercised
+# here.
 #
 # HOST and PORT follow the server's own variables; 127.0.0.1 only works from the
 # machine running the server, so point HOST at it from anywhere else.

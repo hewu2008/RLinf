@@ -1,8 +1,8 @@
 # Server config of the remote inference server (inference/server/main.py).
 #
 # Every value here is static: the two placeholder paths below are the only
-# things to edit. See inference/run_server.sh for how a JAX checkpoint is
-# converted into the torch layout this file points at.
+# things to edit. See scripts/run_inference_server.sh for how a JAX checkpoint
+# is converted into the torch layout this file points at.
 model_type: openpi
 precision: null
 pi05: true

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fold a PEFT-LoRA CFG SFT checkpoint into a bare OpenPI Pi0 checkpoint that
-# inference/run_server.sh can load.
+# scripts/run_inference_server.sh can load.
 #
 # The CFG-RL SFT run (is_lora: true) saves full_weights.pt with PEFT wrapper
 # names and lora_A/lora_B keys; the server loads a bare Pi0 layout and applies
