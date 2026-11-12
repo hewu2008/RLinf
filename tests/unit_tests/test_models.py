@@ -44,7 +44,13 @@ from rlinf.models.embodiment.openpi.apxinf_adapter import (
     OpenPIApxInfAdapter,
     _active_token_ids,
 )
-from rlinf.models.embodiment.openpi.modules.model import IMAGE_KEYS
+from rlinf.models.embodiment.openpi.modules.model import IMAGE_KEYS, Observation
+from rlinf.models.embodiment.openpi.pi0 import Pi0
+from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+    RTCGuidanceContext,
+    sample_actions_with_rtc_guidance,
+)
+from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval, advantage_prompts
 from rlinf.scheduler import Worker
 from rlinf.utils.env_helpers import HistoryManager
 from rlinf.utils.env_helpers.delay_sampler import (
@@ -1493,6 +1499,135 @@ def test_zero_dims_tolerates_samples_without_actions():
     assert zeroed[:, 0].tolist() == [1.0, 1.0]
     assert zeroed[:, 21].tolist() == [0.0, 0.0]
     assert zeroed[:, 22].tolist() == [0.0, 0.0]
+
+
+# Classifier-free guidance in the eval samplers. Both Euler loops integrate the
+# per-step velocity linearly, so a stand-in whose velocity is constant per
+# branch pins the mixing weight exactly.
+
+
+def _cfg_observation(branch: float) -> Observation:
+    """Observation whose ``state`` carries the branch identity."""
+    return Observation(
+        images={key: torch.zeros(1, 224, 224, 3) for key in IMAGE_KEYS},
+        image_masks={key: torch.ones(1, dtype=torch.bool) for key in IMAGE_KEYS},
+        state=torch.full((1, 1), branch),
+        tokenized_prompt=torch.zeros(1, 4, dtype=torch.long),
+        tokenized_prompt_mask=torch.ones(1, 4, dtype=torch.bool),
+    )
+
+
+class _BranchedVelocityPi0:
+    """Stand-in Pi0 whose velocity is the observation's ``state[0, 0]``."""
+
+    action_horizon = 2
+    action_dim = 2
+
+    def build_prefix_cache(self, observation):
+        return None, torch.ones(1, 1, dtype=torch.bool), float(observation.state[0, 0])
+
+    def run_suffix(self, observation, x_t, t_tensor, kv_cache, prefix_mask):
+        return torch.full_like(x_t, kv_cache)
+
+    def velocity_from_suffix(self, suffix_out_act):
+        return suffix_out_act
+
+
+def test_cfg_mixes_the_plain_and_advantaged_velocity():
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    noise = torch.zeros(1, 2, 2)
+    model = _BranchedVelocityPi0()
+
+    def sample(observation, **kwargs):
+        return Pi0.sample_actions(
+            model, observation, num_steps=4, noise=noise.clone(), **kwargs
+        )
+
+    v_plain = sample(plain)
+    v_advantage = sample(advantage)
+    v_mixed = sample(plain, cond_observation=advantage, cfg_scale=0.25)
+
+    torch.testing.assert_close(v_plain, torch.zeros_like(v_plain))
+    torch.testing.assert_close(v_advantage, -torch.ones_like(v_advantage))
+    torch.testing.assert_close(v_mixed, 0.75 * v_plain + 0.25 * v_advantage)
+
+
+def test_rtc_sampling_mixes_the_cfg_velocity():
+    plain = _cfg_observation(0.0)
+    advantage = _cfg_observation(1.0)
+    noise = torch.zeros(1, 2, 2)
+    model = _BranchedVelocityPi0()
+    rtc_context = RTCGuidanceContext()
+
+    def sample(observation, **kwargs):
+        return sample_actions_with_rtc_guidance(
+            model,
+            observation,
+            rtc_context,
+            num_steps=4,
+            noise=noise.clone(),
+            **kwargs,
+        )
+
+    v_plain = sample(plain)
+    v_advantage = sample(advantage)
+    v_mixed = sample(plain, cond_observation=advantage, cfg_scale=0.5)
+
+    torch.testing.assert_close(v_plain, torch.zeros_like(v_plain))
+    torch.testing.assert_close(v_advantage, -torch.ones_like(v_advantage))
+    torch.testing.assert_close(v_mixed, 0.5 * (v_plain + v_advantage))
+
+
+def test_advantage_prompts_match_the_cfg_training_suffix():
+    assert advantage_prompts(["sort the objects"], "positive") == [
+        "sort the objects\nAdvantage: positive"
+    ]
+    assert advantage_prompts(["sort the objects"], "negative") == [
+        "sort the objects\nAdvantage: negative"
+    ]
+    with pytest.raises(ValueError, match="guidance_type"):
+        advantage_prompts(["sort the objects"], "no_guide")
+
+
+def test_cfg_guidance_observation_is_skipped_at_zero_scale():
+    def env_obs_to_observation(env_obs):
+        raise AssertionError("cfgrl_guidance_scale=0 must not build a second branch")
+
+    evaluator = SimpleNamespace(
+        cfgrl_guidance_scale=0.0,
+        guidance_type="positive",
+        env_obs_to_observation=env_obs_to_observation,
+    )
+
+    assert (
+        Pi0Eval._guidance_observation(evaluator, {"task_descriptions": ["sort"]})
+        is None
+    )
+
+
+def test_cfg_guidance_observation_appends_the_advantage_suffix():
+    seen = {}
+
+    def env_obs_to_observation(env_obs):
+        seen.update(env_obs)
+        return _cfg_observation(1.0)
+
+    evaluator = SimpleNamespace(
+        cfgrl_guidance_scale=0.5,
+        guidance_type="positive",
+        env_obs_to_observation=env_obs_to_observation,
+    )
+    env_obs = {
+        "states": np.zeros((1, 23), dtype=np.float32),
+        "task_descriptions": ["sort"],
+    }
+
+    observation = Pi0Eval._guidance_observation(evaluator, env_obs)
+
+    assert observation is not None
+    assert seen["task_descriptions"] == ["sort\nAdvantage: positive"]
+    assert env_obs["task_descriptions"] == ["sort"]
 
 
 def _stub_apxinf_robo(monkeypatch, resolved_tactics=None):

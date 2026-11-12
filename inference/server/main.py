@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from inference.server.policy_service import PolicyService
 from inference.server.websocket_server import WebsocketPolicyServer
@@ -57,7 +57,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="skip the synthetic warmup requests",
     )
+    parser.add_argument(
+        "--cfg-beta",
+        type=float,
+        default=None,
+        help=(
+            "override openpi.cfgrl_guidance_scale: 0 samples the plain prompt, "
+            "1 the advantage-conditioned one, values between interpolate"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def apply_cli_overrides(cfg: DictConfig, args: argparse.Namespace) -> DictConfig:
+    """Fold the command-line flags into the loaded server YAML."""
+    if args.host is not None:
+        cfg.server.host = args.host
+    if args.port is not None:
+        cfg.server.port = args.port
+    if args.default_prompt is not None:
+        cfg.server.default_prompt = args.default_prompt
+    if args.rtc is not None:
+        cfg.openpi.rtc_enabled = args.rtc
+    if args.warmup is not None:
+        cfg.server.warmup = args.warmup
+    if args.cfg_beta is not None:
+        cfg.openpi.cfgrl_guidance_scale = float(args.cfg_beta)
+    return cfg
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -69,17 +95,7 @@ def main(argv: list[str] | None = None) -> None:
         force=True,
     )
 
-    cfg = OmegaConf.load(args.config)
-    if args.host is not None:
-        cfg.server.host = args.host
-    if args.port is not None:
-        cfg.server.port = args.port
-    if args.default_prompt is not None:
-        cfg.server.default_prompt = args.default_prompt
-    if args.rtc is not None:
-        cfg.openpi.rtc_enabled = args.rtc
-    if args.warmup is not None:
-        cfg.server.warmup = args.warmup
+    cfg = apply_cli_overrides(OmegaConf.load(args.config), args)
 
     service = PolicyService(cfg)
     if bool(OmegaConf.select(cfg, "server.warmup", default=True)):

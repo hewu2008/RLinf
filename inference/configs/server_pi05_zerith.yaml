@@ -34,6 +34,13 @@ openpi:
   rtc_enabled: true
   rtc_guidance_mode: approx
   rtc_guidance_clip: 5.0
+  # Classifier-free guidance: every denoise step mixes the plain-prompt branch
+  # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the
+  # conditioned prompt appends "\nAdvantage: <guidance_type>" as in training.
+  # 0.0 samples the plain prompt (one forward per step), 1.0 the conditioned
+  # branch alone; both cost an extra forward per step. --cfg-beta overrides it.
+  cfgrl_guidance_scale: 1.0
+  guidance_type: positive
 
 openpi_data:
   norm_stats_path: /data/4T-1/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi/zerith/norm_stats.json

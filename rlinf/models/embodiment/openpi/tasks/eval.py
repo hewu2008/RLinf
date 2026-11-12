@@ -14,20 +14,39 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal, Sequence
 
 import numpy as np
 import torch
 
 from rlinf.models.embodiment.openpi.env_io import EnvIO
-from rlinf.models.embodiment.openpi.modules.model import preprocess_observation
+from rlinf.models.embodiment.openpi.modules.model import (
+    Observation,
+    preprocess_observation,
+)
 from rlinf.models.embodiment.openpi.pi0 import Pi0
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
 
+CFG_GUIDANCE_TYPES = ("positive", "negative")
+"""Advantage suffixes the CFG-RL training data used for the conditioned branch."""
+
+
+def advantage_prompts(descriptions: Sequence[str], guidance_type: str) -> list[str]:
+    """Append the advantage suffix that conditions the CFG branch."""
+    if guidance_type not in CFG_GUIDANCE_TYPES:
+        raise ValueError(
+            f"guidance_type must be one of {list(CFG_GUIDANCE_TYPES)}, "
+            f"got {guidance_type!r}"
+        )
+    return [
+        f"{description}\nAdvantage: {guidance_type}" for description in descriptions
+    ]
+
 
 class Pi0Eval(EnvIO, Pi0):
-    """Inference-only: deterministic Euler sampling, optional RTC guidance."""
+    """Inference-only: deterministic Euler sampling, optional CFG / RTC guidance."""
 
     def __init__(
         self,
@@ -42,6 +61,8 @@ class Pi0Eval(EnvIO, Pi0):
         rtc_enabled: bool = False,
         rtc_guidance_mode: str = "approx",
         rtc_guidance_clip: float = 5.0,
+        cfgrl_guidance_scale: float = 0.0,
+        guidance_type: str = "positive",
     ):
         super().__init__(
             config,
@@ -52,9 +73,17 @@ class Pi0Eval(EnvIO, Pi0):
             state_indices=state_indices,
             rlt_cfg=rlt_cfg,
         )
+        if not math.isfinite(cfgrl_guidance_scale) or cfgrl_guidance_scale < 0.0:
+            raise ValueError(
+                "cfgrl_guidance_scale must be finite and >= 0, "
+                f"got {cfgrl_guidance_scale!r}"
+            )
+        advantage_prompts([], guidance_type)
         self.rtc_enabled = rtc_enabled
         self.rtc_guidance_mode = rtc_guidance_mode
         self.rtc_guidance_clip = rtc_guidance_clip
+        self.cfgrl_guidance_scale = float(cfgrl_guidance_scale)
+        self.guidance_type = guidance_type
 
     @torch.no_grad()
     def predict_action_batch(
@@ -75,21 +104,49 @@ class Pi0Eval(EnvIO, Pi0):
                 "use a training task wrapper (rl / dagger / dsrl) for train rollouts."
             )
         observation = self.env_obs_to_observation(env_obs)
+        cond_observation = self._guidance_observation(env_obs)
         if rtc_context is not None and self.rtc_enabled:
             if self.rtc_guidance_mode != "approx":
                 raise NotImplementedError(
                     f"Unsupported RTC guidance mode: {self.rtc_guidance_mode!r}"
                 )
             return self._predict_eval_with_rtc(
-                observation, rtc_context=rtc_context, noise=noise, rng=rng
+                observation,
+                rtc_context=rtc_context,
+                cond_observation=cond_observation,
+                noise=noise,
+                rng=rng,
             )
-        return self._predict_eval(observation, noise=noise, rng=rng)
+        return self._predict_eval(
+            observation,
+            noise=noise,
+            rng=rng,
+            cond_observation=cond_observation,
+            cfg_scale=self.cfgrl_guidance_scale,
+        )
+
+    def _guidance_observation(self, env_obs: dict[str, Any]) -> Observation | None:
+        """Advantage-conditioned twin of the request, or ``None`` when CFG is off."""
+        if self.cfgrl_guidance_scale == 0.0:
+            return None
+        descriptions = env_obs.get("task_descriptions")
+        if not descriptions:
+            raise KeyError(
+                "cfgrl_guidance_scale > 0 needs env_obs['task_descriptions'], "
+                f"got {sorted(env_obs)}"
+            )
+        cond_env_obs = dict(env_obs)
+        cond_env_obs["task_descriptions"] = advantage_prompts(
+            descriptions, self.guidance_type
+        )
+        return self.env_obs_to_observation(cond_env_obs)
 
     def _predict_eval_with_rtc(
         self,
         observation,
         *,
         rtc_context,
+        cond_observation,
         noise: torch.Tensor | None,
         rng: torch.Generator | None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -105,6 +162,8 @@ class Pi0Eval(EnvIO, Pi0):
             noise=noise,
             rng=rng,
             guidance_clip=self.rtc_guidance_clip,
+            cond_observation=cond_observation,
+            cfg_scale=self.cfgrl_guidance_scale,
         )
         actions = self.decode_actions(model_actions, observation.state)
         B = actions.shape[0]

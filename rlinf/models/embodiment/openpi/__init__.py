@@ -93,6 +93,12 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     )
     num_steps = OmegaConf.select(model_cfg, "num_steps", default=None)
     num_steps = int(num_steps) if num_steps is not None else int(cfg.num_steps)
+    cfgrl_guidance_scale = OmegaConf.select(
+        model_cfg, "cfgrl_guidance_scale", default=None
+    )
+    cfgrl_guidance_scale = (
+        0.0 if cfgrl_guidance_scale is None else float(cfgrl_guidance_scale)
+    )
 
     pi0_kwargs = {
         "pi05": pi05,
@@ -147,6 +153,10 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             ),
             rtc_guidance_clip=float(
                 OmegaConf.select(model_cfg, "rtc_guidance_clip", default=5.0)
+            ),
+            cfgrl_guidance_scale=cfgrl_guidance_scale,
+            guidance_type=str(
+                OmegaConf.select(model_cfg, "guidance_type", default="positive")
             ),
         )
         _install_transforms(model, cfg, config_name)
@@ -270,7 +280,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     source = full_weights_path if full_weights_path is not None else safetensors_path
     logger.info(
         "openpi[%s]: loaded %s (%.2fB params) from %s precision=%s "
-        "num_steps=%s action_horizon=%s action_chunk=%s",
+        "num_steps=%s action_horizon=%s action_chunk=%s cfgrl_guidance_scale=%s",
         task,
         pi0_config,
         n_params / 1e9,
@@ -279,6 +289,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         num_steps,
         action_horizon,
         action_chunk,
+        cfgrl_guidance_scale,
     )
     return model
 

@@ -305,6 +305,33 @@ def test_pack_unpack_round_trips_arrays_and_bytes():
     assert decoded["rtc"]["executed_horizon"] == 3
 
 
+def test_server_cli_overrides_the_cfg_scale():
+    from omegaconf import OmegaConf
+
+    from inference.server.main import apply_cli_overrides, parse_args
+
+    def load():
+        return OmegaConf.create(
+            {
+                "openpi": {"cfgrl_guidance_scale": 0.0, "rtc_enabled": True},
+                "server": {"host": "0.0.0.0", "port": 55555, "warmup": True},
+            }
+        )
+
+    args = parse_args(
+        ["--config", "server.yaml", "--cfg-beta", "1.5", "--port", "60000"]
+    )
+    cfg = apply_cli_overrides(load(), args)
+
+    assert cfg.openpi.cfgrl_guidance_scale == pytest.approx(1.5)
+    assert cfg.server.port == 60000
+    assert cfg.server.host == "0.0.0.0"
+
+    untouched = apply_cli_overrides(load(), parse_args(["--config", "server.yaml"]))
+    assert untouched.openpi.cfgrl_guidance_scale == pytest.approx(0.0)
+    assert untouched.openpi.rtc_enabled is True
+
+
 def test_websocket_server_serves_chunks_and_forwards_tracebacks():
     pytest.importorskip("msgpack")
     pytest.importorskip("websockets")

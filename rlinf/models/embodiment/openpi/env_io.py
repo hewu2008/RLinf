@@ -142,10 +142,17 @@ class EnvIO:
         *,
         noise: torch.Tensor | None = None,
         rng: torch.Generator | None = None,
+        cond_observation: Observation | None = None,
+        cfg_scale: float = 0.0,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Deterministic Euler ODE sampler shared by eval / RL eval / DAgger."""
         model_actions = self.sample_actions(
-            observation, num_steps=self.num_steps, noise=noise, rng=rng
+            observation,
+            num_steps=self.num_steps,
+            noise=noise,
+            rng=rng,
+            cond_observation=cond_observation,
+            cfg_scale=cfg_scale,
         )
         actions = self.decode_actions(model_actions, observation.state)
         B = actions.shape[0]

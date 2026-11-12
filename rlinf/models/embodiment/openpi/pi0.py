@@ -526,6 +526,8 @@ class Pi0(model.BaseModel):
         num_steps: int = 10,
         noise: torch.Tensor | None = None,
         rng: torch.Generator | None = None,
+        cond_observation: model.Observation | None = None,
+        cfg_scale: float = 0.0,
     ) -> torch.Tensor:
         """Sample actions using Euler ODE solver.
 
@@ -534,11 +536,21 @@ class Pi0(model.BaseModel):
             num_steps: number of ODE solver steps
             noise: optional initial noise of shape (B, action_horizon, action_dim)
             rng: random generator
+            cond_observation: advantage-conditioned twin of ``observation``.
+                When given, each step mixes both velocity fields with
+                ``cfg_scale`` (classifier-free guidance); ``None`` samples the
+                plain path only.
+            cfg_scale: guidance weight in ``(1 - cfg_scale) * v + cfg_scale *
+                v_cond``; 0 keeps the plain path, 1 uses the conditioned branch.
 
         Returns:
             actions: (B, action_horizon, action_dim)
         """
         observation = model.preprocess_observation(observation, train=False)
+        if cond_observation is not None:
+            cond_observation = model.preprocess_observation(
+                cond_observation, train=False
+            )
 
         dt = -1.0 / num_steps
         B = observation.state.shape[0]
@@ -550,6 +562,10 @@ class Pi0(model.BaseModel):
             )
 
         _, prefix_mask, kv_cache = self.build_prefix_cache(observation)
+        if cond_observation is not None:
+            _, cond_prefix_mask, cond_kv_cache = self.build_prefix_cache(
+                cond_observation
+            )
 
         x_t = noise
         t = 1.0
@@ -561,6 +577,12 @@ class Pi0(model.BaseModel):
                 observation, x_t, t_tensor, kv_cache, prefix_mask
             )
             v_t = self.velocity_from_suffix(suffix_out_act)
+            if cond_observation is not None:
+                cond_suffix_out_act = self.run_suffix(
+                    cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
+                )
+                v_t_cond = self.velocity_from_suffix(cond_suffix_out_act)
+                v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
             x_t = x_t + dt * v_t
             t = t + dt
 

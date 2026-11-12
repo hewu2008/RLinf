@@ -94,9 +94,19 @@ def sample_actions_with_rtc_guidance(
     noise: torch.Tensor | None = None,
     rng: torch.Generator | None = None,
     guidance_clip: float = 5.0,
+    cond_observation=None,
+    cfg_scale: float = 0.0,
 ) -> torch.Tensor:
-    """Euler ODE sampling with overlap guidance against the previous chunk."""
+    """Euler ODE sampling with overlap guidance against the previous chunk.
+
+    ``cond_observation`` enables classifier-free guidance: each step's velocity
+    becomes ``(1 - cfg_scale) * v + cfg_scale * v_cond``, with the overlap term
+    applied to the mixed velocity.
+    """
     observation = preprocess_observation(observation, train=False)
+    if cond_observation is not None:
+        cond_observation = preprocess_observation(cond_observation, train=False)
+
     B = observation.state.shape[0]
     device = observation.state.device
     if noise is None:
@@ -113,6 +123,11 @@ def sample_actions_with_rtc_guidance(
 
     prefix_out, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
     del prefix_out
+    if cond_observation is not None:
+        cond_prefix_out, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
+            cond_observation
+        )
+        del cond_prefix_out
 
     prev_remaining = (
         rtc_context.get_prev_remaining() if rtc_context is not None else None
@@ -138,6 +153,12 @@ def sample_actions_with_rtc_guidance(
             observation, x_t, t_tensor, kv_cache, prefix_mask
         )
         v_t = pi0_model.velocity_from_suffix(suffix_act).to(torch.float32)
+        if cond_observation is not None:
+            cond_suffix_act = pi0_model.run_suffix(
+                cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
+            )
+            v_t_cond = pi0_model.velocity_from_suffix(cond_suffix_act).to(torch.float32)
+            v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
         idx_step.fill_(idx)
         x_t_mean, x_t_std = rl_sampler.sample_mean_var(
             x_t.to(torch.float32),
