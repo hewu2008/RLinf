@@ -21,6 +21,7 @@ subclasses (eval / RL / DAgger / DSRL) inherit this module.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -34,6 +35,7 @@ from rlinf.models.embodiment.openpi.modules import gemma, model, pointnet, sigli
 from rlinf.models.embodiment.openpi.modules.utils import _str_to_dtype
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
+from rlinf.utils.logging import get_logger
 
 
 def make_attn_mask(input_mask: torch.Tensor, mask_ar: torch.Tensor) -> torch.Tensor:
@@ -569,6 +571,10 @@ class Pi0(model.BaseModel):
 
         x_t = noise
         t = 1.0
+        logger = get_logger()
+        log_guidance = logger.isEnabledFor(logging.DEBUG) and (
+            cond_observation is not None
+        )
 
         # Euler integration
         while t >= -dt / 2:
@@ -582,6 +588,16 @@ class Pi0(model.BaseModel):
                     cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
                 )
                 v_t_cond = self.velocity_from_suffix(cond_suffix_out_act)
+                if log_guidance:
+                    logger.debug(
+                        "cfg step t=%.3f scale=%.3f |v|=%.4f |v_cond|=%.4f "
+                        "|v_cond-v|=%.4f",
+                        t,
+                        cfg_scale,
+                        v_t.float().norm().item(),
+                        v_t_cond.float().norm().item(),
+                        (v_t_cond.float() - v_t.float()).norm().item(),
+                    )
                 v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
             x_t = x_t + dt * v_t
             t = t + dt

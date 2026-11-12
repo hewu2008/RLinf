@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any, Literal, Sequence
 
@@ -28,6 +29,7 @@ from rlinf.models.embodiment.openpi.modules.model import (
 from rlinf.models.embodiment.openpi.pi0 import Pi0
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
+from rlinf.utils.logging import get_logger
 
 CFG_GUIDANCE_TYPES = ("positive", "negative")
 """Advantage suffixes the CFG-RL training data used for the conditioned branch."""
@@ -84,6 +86,17 @@ class Pi0Eval(EnvIO, Pi0):
         self.rtc_guidance_clip = rtc_guidance_clip
         self.cfgrl_guidance_scale = float(cfgrl_guidance_scale)
         self.guidance_type = guidance_type
+        get_logger().info(
+            "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
+            "num_steps=%d rtc=%s mode=%s clip=%.2f",
+            self.cfgrl_guidance_scale,
+            guidance_type,
+            "advantage" if self.cfgrl_guidance_scale > 0.0 else "off",
+            num_steps,
+            rtc_enabled,
+            rtc_guidance_mode,
+            rtc_guidance_clip,
+        )
 
     @torch.no_grad()
     def predict_action_batch(
@@ -105,6 +118,20 @@ class Pi0Eval(EnvIO, Pi0):
             )
         observation = self.env_obs_to_observation(env_obs)
         cond_observation = self._guidance_observation(env_obs)
+        logger = get_logger()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Pi0Eval request: batch=%d cfg_scale=%.3f guidance_type=%s "
+                "cond=%s rtc=%s",
+                observation.state.shape[0],
+                self.cfgrl_guidance_scale,
+                self.guidance_type,
+                "advantage" if cond_observation is not None else "off",
+                "off"
+                if rtc_context is None
+                else f"exec={rtc_context.executed_horizon} "
+                f"delay={rtc_context.delay_steps}",
+            )
         if rtc_context is not None and self.rtc_enabled:
             if self.rtc_guidance_mode != "approx":
                 raise NotImplementedError(

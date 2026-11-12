@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-import time
 import traceback
 
 import websockets.asyncio.server
@@ -106,15 +105,8 @@ class WebsocketPolicyServer:
                         "expected a msgpack binary frame from the client, got "
                         f"text: {frame[:200]!r}"
                     )
-                receive_start = time.monotonic()
                 observation = protocol.unpack(frame)
-                infer_start = time.monotonic()
                 response = self._service.infer(observation, session)
-                logger.info(
-                    "receive %.4fs, infer %.4fs",
-                    infer_start - receive_start,
-                    time.monotonic() - infer_start,
-                )
                 await websocket.send(protocol.pack(response))
             except websockets.ConnectionClosed:
                 logger.info("connection from %s closed", websocket.remote_address)

@@ -21,6 +21,7 @@ sampler; the Euler loop below is the vendored-Pi0 implementation.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -28,6 +29,7 @@ import torch
 
 from rlinf.models.embodiment.openpi.modules.model import preprocess_observation
 from rlinf.models.embodiment.openpi.sampling import rl_sampler
+from rlinf.utils.logging import get_logger
 
 
 @dataclass
@@ -145,6 +147,8 @@ def sample_actions_with_rtc_guidance(
     paper_tau = torch.tensor(0.0, device=device, dtype=noise.dtype)
     dt = torch.tensor(1.0 / num_steps, device=device, dtype=noise.dtype)
     idx_step = torch.empty(B, device=device, dtype=torch.long)
+    logger = get_logger()
+    log_guidance = logger.isEnabledFor(logging.DEBUG) and cond_observation is not None
 
     for idx in range(num_steps):
         t_val = float(rl_sampler.get_timesteps(num_steps, device)[idx].item())
@@ -158,6 +162,15 @@ def sample_actions_with_rtc_guidance(
                 cond_observation, x_t, t_tensor, cond_kv_cache, cond_prefix_mask
             )
             v_t_cond = pi0_model.velocity_from_suffix(cond_suffix_act).to(torch.float32)
+            if log_guidance:
+                logger.debug(
+                    "cfg step t=%.3f scale=%.3f |v|=%.4f |v_cond|=%.4f |v_cond-v|=%.4f",
+                    t_val,
+                    cfg_scale,
+                    v_t.norm().item(),
+                    v_t_cond.norm().item(),
+                    (v_t_cond - v_t).norm().item(),
+                )
             v_t = (1.0 - cfg_scale) * v_t + cfg_scale * v_t_cond
         idx_step.fill_(idx)
         x_t_mean, x_t_std = rl_sampler.sample_mean_var(

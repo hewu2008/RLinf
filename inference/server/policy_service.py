@@ -76,6 +76,8 @@ class PolicyService:
         )
 
         self._model = self._build_model(cfg)
+        self._cfg_scale = float(getattr(self._model, "cfgrl_guidance_scale", 0.0))
+        self._guidance_type = getattr(self._model, "guidance_type", "off")
         chunk = getattr(self._model, "action_chunk", None) or self._model.action_horizon
         self._metadata = build_metadata(
             action_horizon=int(chunk),
@@ -84,11 +86,15 @@ class PolicyService:
             rtc_guided=self._rtc_enabled,
         )
         logger.info(
-            "policy ready on %s: horizon=%d action_dim=%d rtc=%s",
+            "policy ready on %s: horizon=%d action_dim=%d rtc=%s "
+            "cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s",
             self._device,
             chunk,
             self._action_dim,
             "guided" if self._rtc_enabled else "off",
+            self._cfg_scale,
+            self._guidance_type,
+            "advantage" if self._cfg_scale > 0.0 else "off",
         )
 
     @property
@@ -133,14 +139,20 @@ class PolicyService:
         )
 
         rtc_context = None
+        rtc_desc = "off"
         request = observation.get("rtc")
         chunk_id = session.chunk_id + 1
         if request is not None:
             payload = validate_rtc_payload(request)
             chunk_id = payload["chunk_id"] or chunk_id
+            rtc_desc = str(payload["request_type"])
             if self._rtc_enabled and payload["request_type"] == "replan":
                 if session.model_actions is not None:
                     rtc_context = self._build_rtc_context(session, payload)
+                    rtc_desc = (
+                        f"replan exec={payload['executed_horizon']} "
+                        f"delay={payload['predicted_delay_steps']}"
+                    )
 
         actions, result = self._model.predict_action_batch(
             env_obs=env_obs, mode="eval", rtc_context=rtc_context
@@ -151,6 +163,18 @@ class PolicyService:
         session.chunk_id = chunk_id
 
         chunk = actions.detach().to("cpu", dtype=torch.float32).numpy()[0]
+        # CFG reuses one extra forward per denoise step, so log every guided
+        # request; plain requests only show up under DEBUG.
+        log = logger.info if self._cfg_scale > 0.0 else logger.debug
+        log(
+            "chunk %d: cfg_scale=%.2f guidance_type=%s rtc=%s actions=%s infer=%.3fs",
+            chunk_id,
+            self._cfg_scale,
+            self._guidance_type,
+            rtc_desc,
+            tuple(chunk.shape),
+            time.monotonic() - start,
+        )
         return {
             "actions": chunk,
             "chunk_id": chunk_id,
