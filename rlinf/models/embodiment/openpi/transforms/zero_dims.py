@@ -31,6 +31,10 @@ class ZeroDims(_transforms.DataTransformFn):
     dims: tuple[int, ...]
 
     def __call__(self, data: dict) -> dict:
+        # Inference samples carry no actions; the same transform sits in the input
+        # group before DeltaActions, so it must tolerate their absence.
+        if "actions" not in data:
+            return data
         actions = data["actions"]
         actions = actions.copy() if isinstance(actions, np.ndarray) else actions.clone()
         actions[..., list(self.dims)] = 0

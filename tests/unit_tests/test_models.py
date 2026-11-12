@@ -1478,6 +1478,23 @@ def test_zerith_repack_splits_the_two_wrist_views():
     assert repacked["prompt"] == ["sort the objects"]
 
 
+def test_zero_dims_tolerates_samples_without_actions():
+    pytest.importorskip("numpy")
+    pytest.importorskip("openpi")
+    from rlinf.models.embodiment.openpi.transforms.zero_dims import ZeroDims
+
+    # The transform sits in the input group, which an inference sample reaches
+    # without actions; training samples still get the base-velocity dims zeroed.
+    sample = {"state": np.zeros(23, dtype=np.float32), "prompt": "sort"}
+    assert "actions" not in ZeroDims((21, 22))(sample)
+
+    with_actions = {"actions": np.ones((2, 23), dtype=np.float32)}
+    zeroed = ZeroDims((21, 22))(with_actions)["actions"]
+    assert zeroed[:, 0].tolist() == [1.0, 1.0]
+    assert zeroed[:, 21].tolist() == [0.0, 0.0]
+    assert zeroed[:, 22].tolist() == [0.0, 0.0]
+
+
 def _stub_apxinf_robo(monkeypatch, resolved_tactics=None):
     """Install a fake ``apxinf_robo`` and record what ``_load_model`` asks it for."""
     seen = {}
