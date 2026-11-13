@@ -17,11 +17,12 @@ RTC 的核心思想是将策略推理与动作执行流水线化。标准 rollou
 3. **延迟自适应**：RTC 维护一个滑动窗口（``delay_buffer_size``）记录实际观测到的推理延迟，用于预测下一轮请求时机。
 4. **停止**：episode 结束（或达到最大步数）后，Env Worker 发送 ``stop`` 信号终止 Rollout Worker 循环。
 
-RTC 使用 ``软重叠引导``\ （soft overlap guidance）来平滑 chunk 边界。当新 chunk 到达时，前一个 chunk 可能还有若干步未执行。RTC 引导机制使新 chunk 的前 ``delay_steps`` 步与旧 chunk 的剩余部分保持一致，避免动作突变：
+RTC 使用 ``软重叠引导``\ （soft overlap guidance）来平滑 chunk 边界，实现遵循论文 *Real-Time Execution of Action Chunking Flow Policies* 的 Algorithm 1。当新 chunk 到达时，前一个 chunk 可能还有若干步未执行。RTC 引导机制使新 chunk 的前 ``delay_steps`` 步与旧 chunk 的剩余部分保持一致，避免动作突变：
 
 - ``硬掩码`` （hard mask）：前 ``delay_steps`` 步，强制使用旧 chunk 的剩余动作。
 - ``软掩码`` （soft mask）：后续若干步，通过指数衰减引导新 chunk 逐渐过渡到其自身预测。
-- 引导强度由 ``rtc_guidance_clip`` 限制，避免过度修正。
+- 残差按一步到位估计 ``x1 = x - t v`` 计算，权重为 ``min(clip, (τ² + (1-τ)²) / (τ(1-τ)))``，并按 ``x ← x - dt·v + dt·w·correction`` 应用。
+- ``rtc_guidance_mode`` 选择修正项：``approx`` 直接用残差（恒等 Jacobian，可走 CUDA graph），``exact`` 用 autograd 计算 PiGDM 的 ``(I - t ∂v/∂x)ᵀ`` 修正（每步多一次反向，该路径以 eager 方式运行）。``rtc_guidance_steps`` 可只让前若干步走精确修正，其余回退到 ``approx``。
 
 仿真实验
 --------
@@ -309,7 +310,10 @@ RTC 参数分布在两个位置：
      - 建议使用 Hydra 引用 ``${runner.rtc.enabled}`` 保持同步。启用后模型输出 action chunk 时会参考前一 chunk 的剩余动作。
    * - ``rtc_guidance_mode``
      - ``"approx"``
-     - 引导模式，当前仅支持 ``"approx"`` （近似引导）。
+     - 引导模式：``"approx"`` 用恒等 Jacobian 的近似修正（无反向传播，可走 CUDA graph），``"exact"`` 用 PiGDM 的向量-雅可比积精确修正（每步多一次反向，RTC 回路以 eager 运行）。
+   * - ``rtc_guidance_steps``
+     - ``null``
+     - 前多少步使用所选修正项，其余步回退到 ``"approx"``；``null`` 表示每一步都用所选模式。设成较小的值可以在 ``"exact"`` 下限制反向传播次数。
    * - ``rtc_guidance_clip``
      - ``5.0``
-     - 引导强度裁剪阈值。值越大引导越强，chunk 边界越平滑；过大可能导致动作偏离。推荐范围 3.0-10.0。
+     - 引导权重的上界（论文中的 β）。值越大引导越强，chunk 边界越平滑；过大可能导致动作偏离。推荐范围 3.0-10.0。

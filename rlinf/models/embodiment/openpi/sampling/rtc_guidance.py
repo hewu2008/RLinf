@@ -16,7 +16,17 @@
 
 ``RTCGuidanceContext`` and ``build_rtc_target_and_mask`` are the shared
 protocol used by both ``openpi`` and the leftover OpenPI PyTorch
-sampler; the Euler loop below is the vendored-Pi0 implementation.
+sampler; the Euler loop below is the vendored-Pi0 implementation of
+Algorithm 1 from "Real-Time Execution of Action Chunking Flow Policies".
+
+Two guidance modes are available:
+
+``approx``
+    Identity Jacobian (``correction = err``). No backward pass, so the loop can
+    still be served from a captured CUDA graph. This is the legacy behaviour.
+``exact``
+    The PiGDM vector-Jacobian product ``(I - t d v / d x)^T err`` of Eq. (pigdm1),
+    computed with autograd through the suffix forward.
 """
 
 from __future__ import annotations
@@ -86,6 +96,38 @@ def build_rtc_target_and_mask(
     return target, mask
 
 
+def rtc_guidance_scale(paper_tau: torch.Tensor, guidance_clip: float) -> torch.Tensor:
+    """PiGDM guidance weight ``min(clip, (tau^2 + (1-tau)^2) / (tau (1-tau)))``.
+
+    ``paper_tau`` is the denoising progress ``tau = 1 - t`` of the paper, so the
+    sampler's ``t = 1 - paper_tau`` and both ends of the loop clamp at ``clip``.
+    """
+    complement = 1.0 - paper_tau
+    numerator = paper_tau * paper_tau + complement * complement
+    denominator = torch.clamp(paper_tau * complement, min=1e-6)
+    return torch.clamp(numerator / denominator, max=float(guidance_clip))
+
+
+def _branch_velocity(
+    pi0_model,
+    observation,
+    x_batched: torch.Tensor,
+    t_tensor: torch.Tensor,
+    kv_cache: tuple,
+    prefix_mask: torch.Tensor,
+    batch_size: int,
+    cfg_scale: float,
+) -> torch.Tensor:
+    """Suffix velocity of ``x_batched``, mixing the CFG branches when present."""
+    suffix_act = pi0_model.run_suffix(
+        observation, x_batched, t_tensor, kv_cache, prefix_mask
+    )
+    v_t = pi0_model.velocity_from_suffix(suffix_act).to(torch.float32)
+    if x_batched.shape[0] == 2 * batch_size:
+        v_t = (1.0 - cfg_scale) * v_t[:batch_size] + cfg_scale * v_t[batch_size:]
+    return v_t
+
+
 def rtc_denoise_loop(
     pi0_model,
     observation,
@@ -98,15 +140,19 @@ def rtc_denoise_loop(
     num_steps: int,
     guidance_clip: float,
     cfg_scale: float,
+    guidance_mode: str = "approx",
+    guidance_steps: int | None = None,
 ) -> torch.Tensor:
     """Run the guided Euler loop and return the sampled chunk.
 
     Split out of :func:`sample_actions_with_rtc_guidance` so the loop can be
-    replayed from a CUDA graph (:class:`RTCGraphSampler`): every input has a
+    replayed from a CUDA graph (:class:`LoopGraphSampler`): every input has a
     shape that depends only on the model config (batch, ``action_horizon``,
     ``action_dim``, prefix length), nothing synchronizes with the host, and
     nothing branches on a tensor value. Keep it that way - a host copy, a
-    ``.item()`` or a tensor-dependent ``if`` invalidates the capture.
+    ``.item()`` or a tensor-dependent ``if`` invalidates the capture. The
+    ``guidance_mode="exact"`` path is the exception: it runs autograd and is
+    therefore served eagerly (see ``Pi0Eval.enable_sampler_graph``).
 
     Args:
         pi0_model: the Pi0 / Pi0Eval model providing the prefix cache and suffix
@@ -120,15 +166,29 @@ def rtc_denoise_loop(
         target: overlap target, all zeros when there is no previous chunk.
         mask: overlap mask, all zeros when there is no previous chunk.
         num_steps: number of Euler steps.
-        guidance_clip: upper clamp of the overlap guidance scale.
+        guidance_clip: upper clamp of the overlap guidance scale (paper ``beta``).
         cfg_scale: classifier-free guidance weight, applied as
             ``(1 - cfg_scale) * v + cfg_scale * v_cond``.
+        guidance_mode: ``"approx"`` corrects with the residual itself (identity
+            Jacobian, no backward pass); ``"exact"`` corrects with the PiGDM
+            vector-Jacobian product of Eq. (pigdm1).
+        guidance_steps: number of leading denoise steps served with the exact
+            correction; the rest fall back to ``"approx"``. ``None`` applies the
+            selected mode to every step.
+
+    Each step follows Algorithm 1: the overlap residual is measured against the
+    one-step clean estimate ``x1 = x - t v`` and then pulled onto ``target`` with
+    weight ``w``, ``x <- x - dt v + dt w correction``.
 
     With a conditioned branch the suffix passes run over a batch of ``2B``, so
     each step costs one pass instead of two (measured 1.7x per step, 17% of a
     whole request); the batch axis only ever swaps kernel shapes, the mixed
     velocity is still assembled per branch afterwards.
     """
+    if guidance_mode not in ("approx", "exact"):
+        raise ValueError(
+            f"guidance_mode must be 'approx' or 'exact', got {guidance_mode!r}"
+        )
     B = observation.state.shape[0]
     device = observation.state.device
 
@@ -150,6 +210,7 @@ def rtc_denoise_loop(
         )
         branches = 2
 
+    exact_steps = num_steps if guidance_steps is None else int(guidance_steps)
     x_t = noise
     # ``torch.zeros`` / ``torch.full`` fill on the device; ``torch.tensor(...,
     # device=...)`` would copy host memory and abort a CUDA graph capture.
@@ -159,13 +220,41 @@ def rtc_denoise_loop(
 
     for idx in range(num_steps):
         t_tensor = timesteps[idx].repeat(B * branches)
-        suffix_act = pi0_model.run_suffix(
-            observation, x_t.repeat(branches, 1, 1), t_tensor, kv_cache, prefix_mask
-        )
-        v_t = pi0_model.velocity_from_suffix(suffix_act).to(torch.float32)
-        if branches == 2:
-            v_t_cond = v_t[B:]
-            v_t = (1.0 - cfg_scale) * v_t[:B] + cfg_scale * v_t_cond
+        t_step = timesteps[idx]
+        if guidance_mode == "exact" and idx < exact_steps:
+            # Eq. (pigdm1): differentiate ``x1 = x - t v(x)`` so the correction
+            # is ``(I - t dv/dx)^T err``. Only x_t is a leaf, so the backward
+            # pass covers the suffix activations alone.
+            with torch.enable_grad():
+                x_in = x_t.detach().requires_grad_(True)
+                v_t = _branch_velocity(
+                    pi0_model,
+                    observation,
+                    x_in.repeat(branches, 1, 1),
+                    t_tensor,
+                    kv_cache,
+                    prefix_mask,
+                    B,
+                    cfg_scale,
+                )
+                x1_t = x_in - t_step * v_t
+                err = (target - x1_t) * mask
+                (correction,) = torch.autograd.grad(x1_t, x_in, grad_outputs=err)
+            v_t = v_t.detach()
+        else:
+            v_t = _branch_velocity(
+                pi0_model,
+                observation,
+                x_t.repeat(branches, 1, 1),
+                t_tensor,
+                kv_cache,
+                prefix_mask,
+                B,
+                cfg_scale,
+            )
+            x1_t = x_t - t_step * v_t
+            correction = (target - x1_t) * mask
+
         idx_step.fill_(idx)
         x_t_mean, _ = rl_sampler.sample_mean_var(
             x_t.to(torch.float32),
@@ -176,15 +265,9 @@ def rtc_denoise_loop(
             num_steps=num_steps,
             timesteps=timesteps,
         )
-        # flow_ode has no step noise, so the guidance term is applied
-        # unconditionally and a request without a previous chunk passes an
-        # all-zero target and mask.
-        guidance_term = (target - x_t_mean) * mask
-        guidance_scale = torch.clamp(
-            (1.0 - paper_tau) / torch.clamp(paper_tau + 1e-4, min=1e-4),
-            max=float(guidance_clip),
-        )
-        x_t = x_t_mean + guidance_scale * guidance_term
+        # Aligning in the flow mean with ``dt`` matches ``x <- x + h (v + w g)``
+        # in the paper's tau = 0 -> 1 parameterisation.
+        x_t = x_t_mean + dt * rtc_guidance_scale(paper_tau, guidance_clip) * correction
         paper_tau = paper_tau + dt
     return x_t
 
@@ -350,6 +433,8 @@ def sample_actions_with_rtc_guidance(
     guidance_clip: float = 5.0,
     cond_observation=None,
     cfg_scale: float = 0.0,
+    guidance_mode: str = "approx",
+    guidance_steps: int | None = None,
     denoise_fn=None,
 ) -> torch.Tensor:
     """Euler ODE sampling with overlap guidance against the previous chunk.
@@ -359,6 +444,9 @@ def sample_actions_with_rtc_guidance(
     applied to the mixed velocity. Both branches are sampled by one suffix pass
     over a doubled batch (:func:`stack_cfg_branches`), which is where a suffix
     step spends its time; the per-sample math is unchanged.
+
+    ``guidance_mode`` and ``guidance_steps`` select the overlap correction, see
+    :func:`rtc_denoise_loop`.
 
     ``denoise_fn`` replaces :func:`rtc_denoise_loop`, which is how a caller
     serves a compiled loop; it receives the same positional arguments and the
@@ -395,6 +483,10 @@ def sample_actions_with_rtc_guidance(
         device=device,
         dtype=noise.dtype,
     )
+    if prev_remaining is None:
+        # First chunk of an episode: the overlap term is zero, so the exact
+        # backward passes would only reproduce the plain Euler loop.
+        guidance_mode = "approx"
 
     run_denoise = rtc_denoise_loop if denoise_fn is None else denoise_fn
     return run_denoise(
@@ -408,4 +500,6 @@ def sample_actions_with_rtc_guidance(
         num_steps=num_steps,
         guidance_clip=guidance_clip,
         cfg_scale=cfg_scale,
+        guidance_mode=guidance_mode,
+        guidance_steps=guidance_steps,
     )

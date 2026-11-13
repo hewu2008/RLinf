@@ -161,6 +161,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             rtc_guidance_clip=float(
                 OmegaConf.select(model_cfg, "rtc_guidance_clip", default=5.0)
             ),
+            rtc_guidance_steps=OmegaConf.select(
+                model_cfg, "rtc_guidance_steps", default=None
+            ),
             cfgrl_guidance_scale=cfgrl_guidance_scale,
             guidance_type=str(
                 OmegaConf.select(model_cfg, "guidance_type", default="positive")

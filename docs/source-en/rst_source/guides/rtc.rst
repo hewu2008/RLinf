@@ -17,11 +17,12 @@ Process:
 3. **Adaptive latency**: RTC maintains a sliding window (``delay_buffer_size``) recording observed inference latency, used to predict when to send the next request.
 4. **Stop**: Once the episode ends (or max steps reached), the Env Worker sends a ``stop`` signal to terminate the Rollout Worker loop.
 
-RTC uses **soft overlap guidance** to smooth chunk boundaries. When a new chunk arrives, the previous chunk may still have several unexecuted steps. The RTC guidance mechanism aligns the first ``delay_steps`` of the new chunk with the remaining steps of the old chunk, avoiding abrupt action changes:
+RTC uses **soft overlap guidance** to smooth chunk boundaries, following Algorithm 1 of *Real-Time Execution of Action Chunking Flow Policies*. When a new chunk arrives, the previous chunk may still have several unexecuted steps. The RTC guidance mechanism aligns the first ``delay_steps`` of the new chunk with the remaining steps of the old chunk, avoiding abrupt action changes:
 
 - **Hard mask**: the first ``delay_steps`` positions, forced to match the old chunk's remaining actions.
 - **Soft mask**: subsequent steps, guided toward the new chunk's predictions with exponential decay.
-- Guidance strength is clipped by ``rtc_guidance_clip`` to avoid over-correction.
+- The residual is measured against the one-step estimate ``x1 = x - t v`` and applied with weight ``min(clip, (τ² + (1-τ)²) / (τ(1-τ)))`` as ``x ← x - dt·v + dt·w·correction``.
+- ``rtc_guidance_mode`` picks the correction: ``approx`` uses the residual itself (identity Jacobian, CUDA-graph friendly), ``exact`` computes the PiGDM ``(I - t ∂v/∂x)ᵀ`` correction with autograd (one extra backward pass per step, served eagerly). ``rtc_guidance_steps`` applies the exact correction to a leading number of steps only.
 
 Simulation Experiment
 ---------------------
@@ -309,7 +310,10 @@ RTC parameters are split across two locations:
      - Use Hydra reference ``${runner.rtc.enabled}`` to keep in sync. When enabled, the model's output action chunk references the previous chunk's remaining actions.
    * - ``rtc_guidance_mode``
      - ``"approx"``
-     - Guidance mode, currently only ``"approx"`` (approximate guidance) is supported.
+     - Guidance mode: ``"approx"`` uses the identity-Jacobian correction (no backward pass, CUDA-graph friendly); ``"exact"`` uses the PiGDM vector-Jacobian correction (one extra backward pass per step, the RTC loop then runs eagerly).
+   * - ``rtc_guidance_steps``
+     - ``null``
+     - Number of leading steps that take the selected correction; the rest fall back to ``"approx"``. ``null`` uses the selected mode for every step. A small value bounds the backward passes under ``"exact"``.
    * - ``rtc_guidance_clip``
      - ``5.0``
-     - Guidance strength clipping threshold. Higher values mean stronger guidance and smoother chunk boundaries; too high may cause action drift. Recommended range 3.0-10.0.
+     - Upper clamp of the guidance weight (``β`` in the paper). Higher values mean stronger guidance and smoother chunk boundaries; too high may cause action drift. Recommended range 3.0-10.0.

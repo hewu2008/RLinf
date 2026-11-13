@@ -30,9 +30,18 @@ openpi:
   max_token_len: 200
   torch_compile: true
   # RTC guidance: a replan request is sampled against the unexecuted tail of the
-  # previous chunk. The client refuses to run in RTC mode if this is false.
+  # previous chunk (paper Algorithm 1). The client refuses to run in RTC mode if
+  # this is false.
   rtc_enabled: true
-  rtc_guidance_mode: approx
+  # "exact" is the PiGDM correction (I - t dv/dx)^T err of the paper, one backward
+  # pass per denoise step; the RTC loop then runs eagerly because a captured CUDA
+  # graph cannot replay autograd. "approx" corrects with err itself: no backward
+  # pass, keeps the graph.
+  rtc_guidance_mode: exact
+  # Leading denoise steps that take the exact correction, the rest fall back to
+  # "approx"; null uses the selected mode for every step.
+  rtc_guidance_steps: null
+  # Upper clamp of the guidance weight (paper beta).
   rtc_guidance_clip: 5.0
   # Classifier-free guidance: every denoise step mixes the plain-prompt branch
   # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the

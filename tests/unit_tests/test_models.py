@@ -51,6 +51,7 @@ from rlinf.models.embodiment.openpi.sampling import rl_sampler
 from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
     RTCGuidanceContext,
     rtc_denoise_loop,
+    rtc_guidance_scale,
     sample_actions_with_rtc_guidance,
 )
 from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval, advantage_prompts
@@ -1584,6 +1585,67 @@ def test_rtc_sampling_mixes_the_cfg_velocity():
     torch.testing.assert_close(v_plain, torch.zeros_like(v_plain))
     torch.testing.assert_close(v_advantage, -torch.ones_like(v_advantage))
     torch.testing.assert_close(v_mixed, 0.5 * (v_plain + v_advantage))
+
+
+class _LinearVelocityPi0:
+    """Stand-in Pi0 with velocity ``v = 2x``, so the Jacobian is known."""
+
+    action_horizon = 1
+    action_dim = 1
+    _plain_denoise_fn = None
+
+    def build_prefix_cache(self, observation):
+        zeros = torch.zeros(1, 1, 1)
+        return None, torch.ones(1, 1, dtype=torch.bool), ((zeros, zeros),)
+
+    def run_suffix(self, observation, x_t, t_tensor, kv_cache, prefix_mask):
+        del observation, t_tensor, kv_cache, prefix_mask
+        return 2.0 * x_t
+
+    def velocity_from_suffix(self, suffix_out_act):
+        return suffix_out_act
+
+
+def test_rtc_guidance_scale_matches_the_paper_formula():
+    def scale(paper_tau, clip=5.0):
+        return rtc_guidance_scale(torch.tensor(paper_tau), clip).item()
+
+    # Both ends of the loop clamp at beta; the middle is (tau^2 + (1-tau)^2)
+    # / (tau (1-tau)).
+    assert scale(0.0) == pytest.approx(5.0)
+    assert scale(0.5) == pytest.approx(2.0)
+    assert scale(1.0) == pytest.approx(5.0)
+    assert scale(0.5, clip=1.0) == pytest.approx(1.0)
+
+
+def test_rtc_exact_guidance_uses_the_pigdm_jacobian():
+    model = _LinearVelocityPi0()
+    observation = _cfg_observation(0.0)
+    target = torch.ones(1, 1, 1)
+    mask = torch.ones(1, 1, 1)
+
+    def sample(mode, guidance_steps=None):
+        return rtc_denoise_loop(
+            model,
+            observation,
+            None,
+            rl_sampler.get_timesteps(1, torch.device("cpu")),
+            torch.zeros(1, 1, 1),
+            target,
+            mask,
+            num_steps=1,
+            guidance_clip=1.0,
+            cfg_scale=0.0,
+            guidance_mode=mode,
+            guidance_steps=guidance_steps,
+        )
+
+    # At t = 1 the clean estimate is x1 = x - t v = -x, so the residual is +1.
+    # Identity applies it as is; the exact mode multiplies by the
+    # (1 - t dv/dx)^T = 1 - 2 Jacobian.
+    torch.testing.assert_close(sample("approx"), torch.ones(1, 1, 1))
+    torch.testing.assert_close(sample("exact"), -torch.ones(1, 1, 1))
+    torch.testing.assert_close(sample("exact", guidance_steps=0), torch.ones(1, 1, 1))
 
 
 def test_rtc_denoise_loop_matches_the_cfg_mix():

@@ -63,6 +63,7 @@ class Pi0Eval(EnvIO, Pi0):
         rtc_enabled: bool = False,
         rtc_guidance_mode: str = "approx",
         rtc_guidance_clip: float = 5.0,
+        rtc_guidance_steps: int | None = None,
         cfgrl_guidance_scale: float = 0.0,
         guidance_type: str = "positive",
     ):
@@ -81,9 +82,21 @@ class Pi0Eval(EnvIO, Pi0):
                 f"got {cfgrl_guidance_scale!r}"
             )
         advantage_prompts([], guidance_type)
+        if rtc_guidance_mode not in ("approx", "exact"):
+            raise ValueError(
+                "rtc_guidance_mode must be 'approx' or 'exact', "
+                f"got {rtc_guidance_mode!r}"
+            )
+        if rtc_guidance_steps is not None and rtc_guidance_steps < 0:
+            raise ValueError(
+                f"rtc_guidance_steps must be >= 0, got {rtc_guidance_steps}"
+            )
         self.rtc_enabled = rtc_enabled
         self.rtc_guidance_mode = rtc_guidance_mode
         self.rtc_guidance_clip = rtc_guidance_clip
+        self.rtc_guidance_steps = (
+            None if rtc_guidance_steps is None else int(rtc_guidance_steps)
+        )
         self.cfgrl_guidance_scale = float(cfgrl_guidance_scale)
         self.guidance_type = guidance_type
         # Both stay ``None`` (the eager loops) until enable_sampler_graph swaps
@@ -91,13 +104,14 @@ class Pi0Eval(EnvIO, Pi0):
         self._rtc_denoise_fn = None
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
-            "num_steps=%d rtc=%s mode=%s clip=%.2f",
+            "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
             self.cfgrl_guidance_scale,
             guidance_type,
             "advantage" if self.cfgrl_guidance_scale > 0.0 else "off",
             num_steps,
             rtc_enabled,
             rtc_guidance_mode,
+            "all" if self.rtc_guidance_steps is None else self.rtc_guidance_steps,
             rtc_guidance_clip,
         )
 
@@ -136,10 +150,6 @@ class Pi0Eval(EnvIO, Pi0):
                 f"delay={rtc_context.delay_steps}",
             )
         if rtc_context is not None and self.rtc_enabled:
-            if self.rtc_guidance_mode != "approx":
-                raise NotImplementedError(
-                    f"Unsupported RTC guidance mode: {self.rtc_guidance_mode!r}"
-                )
             return self._predict_eval_with_rtc(
                 observation,
                 rtc_context=rtc_context,
@@ -169,7 +179,9 @@ class Pi0Eval(EnvIO, Pi0):
         and the camera layout, so changing ``max_token_len``,
         ``num_action_chunks``, ``num_steps`` or the camera resolution
         re-captures. Capture happens on the first call of each path, which the
-        server warmup covers.
+        server warmup covers. The RTC loop is left eager when
+        ``rtc_guidance_mode`` is ``exact``: its autograd pass cannot be replayed
+        from a recorded graph.
         """
         from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
             LoopGraphSampler,
@@ -183,6 +195,17 @@ class Pi0Eval(EnvIO, Pi0):
             )
             return
         self._plain_denoise_fn = LoopGraphSampler(euler_denoise_loop)
+        if self.rtc_guidance_mode == "exact":
+            # The exact PiGDM correction runs autograd inside the loop; a
+            # captured graph replays the recorded kernels without the backward
+            # pass, so the RTC path stays eager in this mode.
+            self._rtc_denoise_fn = None
+            get_logger().info(
+                "Pi0Eval: the plain sampler runs from a captured CUDA graph; "
+                "the RTC loop stays eager because rtc_guidance_mode=exact "
+                "needs autograd"
+            )
+            return
         self._rtc_denoise_fn = LoopGraphSampler(rtc_denoise_loop)
         get_logger().info(
             "Pi0Eval: plain and RTC samplers run from captured CUDA graphs; "
@@ -238,6 +261,8 @@ class Pi0Eval(EnvIO, Pi0):
             guidance_clip=self.rtc_guidance_clip,
             cond_observation=cond_observation,
             cfg_scale=self.cfgrl_guidance_scale,
+            guidance_mode=self.rtc_guidance_mode,
+            guidance_steps=self.rtc_guidance_steps,
             denoise_fn=self._rtc_denoise_fn,
         )
         actions = self.decode_actions(model_actions, observation.state)
