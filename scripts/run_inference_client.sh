@@ -68,9 +68,10 @@ ${launcher} "${PYTHON}" -m inference.client.main \
   --port "${PORT:-55555}" \
   --prompt "Sort all objects into the correct bins using both arms" \
   --init_hdf5 /data/zerith_data/1_clear_the_bin_box_20261027/04742e2eb140434d87b5b8d213741c1e/episode.hdf5 \
+  --init_frame_idx 30 \
   --control_freq 30 \
   --min_exec_horizon 18 \
-  --delay_buffer_size 8 \
+  --delay_buffer_size 10 \
   --num_steps 864000 \
   --save_dir rollouts \
   --task_name clear_the_bin_box \

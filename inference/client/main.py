@@ -279,9 +279,16 @@ def main(argv: list[str] | None = None) -> None:
 
     reference = None
     if args.init_hdf5:
+        logger.info(
+            "loading the start pose from %s frame %d",
+            args.init_hdf5,
+            args.init_frame_idx,
+        )
         reference = load_reference_state(args.init_hdf5, args.init_frame_idx)
+        logger.info("reference state: %s", np.round(reference, 4).tolist())
         env.move_to_target_joint(reference)
         time.sleep(2.0)  # Let the arms settle before the first observation.
+        logger.info("reference pose reached, arms settled")
 
     if args.warmup_steps > 0:
         warm_up(
