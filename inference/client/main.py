@@ -15,8 +15,11 @@
 """Drive the H1 dual-arm robot from a remote policy server.
 
 The control loop stays at a fixed frequency: the inference worker refreshes the
-action chunk in the background and the RTC scheduler decides when the next chunk
-is requested, so inference latency is absorbed by executing the current chunk.
+action chunk in the background and the scheduler decides when the next chunk is
+requested, so inference latency is absorbed by executing the current chunk. The
+scheduler is either the RTC one, which reports the executed horizon so the
+server can guide the replan, or the ACT temporal ensembler, which blends the
+overlapping chunks on the robot side while RTC is off.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from inference.client.h1_robot import DEFAULT_CAMERA_NAMES, STATE_DIM, H1RobotEn
 from inference.client.keyboard import KeyPressListener
 from inference.client.policy_client import WebsocketPolicyClient
 from inference.client.rtc_scheduler import RTCScheduler
+from inference.client.temporal_ensemble import TemporalEnsembleScheduler
 from inference.protocol import encode_frame
 
 logger = logging.getLogger(__name__)
@@ -187,6 +191,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="request whole chunks without RTC guidance",
     )
     parser.add_argument(
+        "--temporal_ensemble",
+        action="store_true",
+        help=(
+            "blend overlapping chunks with ACT temporal ensembling instead of "
+            "running one chunk at a time; requires --no-rtc"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble_coeff",
+        type=float,
+        default=0.05,
+        help=(
+            "weight decay per control step of a chunk's age, used by "
+            "--temporal_ensemble; larger values favour the freshest chunk"
+        ),
+    )
+    parser.add_argument(
         "--init_hdf5", default=None, help="episode used for the start pose"
     )
     parser.add_argument(
@@ -263,6 +284,11 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         force=True,
     )
+    if args.temporal_ensemble and args.rtc:
+        raise ValueError(
+            "temporal ensembling blends chunks on the client while RTC guides "
+            "them on the server; run with --no-rtc to use it"
+        )
 
     env = H1RobotEnv(
         camera_names=args.camera_names,
@@ -307,14 +333,22 @@ def main(argv: list[str] | None = None) -> None:
 
     worker = InferenceWorker(client)
     gripper = GripperHysteresis()
-    scheduler = RTCScheduler(
-        worker,
-        action_horizon=action_horizon,
-        min_exec_horizon=args.min_exec_horizon,
-        delay_buffer_size=args.delay_buffer_size,
-        initial_delay_steps=args.initial_delay_steps,
-        rtc_enabled=args.rtc,
-    )
+    if args.temporal_ensemble:
+        scheduler = TemporalEnsembleScheduler(
+            worker,
+            action_horizon=action_horizon,
+            min_exec_horizon=args.min_exec_horizon,
+            ensemble_coeff=args.ensemble_coeff,
+        )
+    else:
+        scheduler = RTCScheduler(
+            worker,
+            action_horizon=action_horizon,
+            min_exec_horizon=args.min_exec_horizon,
+            delay_buffer_size=args.delay_buffer_size,
+            initial_delay_steps=args.initial_delay_steps,
+            rtc_enabled=args.rtc,
+        )
     keys = KeyPressListener()
     recorder = None
     if args.record:

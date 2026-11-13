@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -28,6 +30,7 @@ from inference.client.episode_recorder import (
 from inference.client.gripper_hysteresis import CLOSED_VALUE, GripperHysteresis
 from inference.client.h1_robot import camera_source_candidates, motor_position
 from inference.client.rtc_scheduler import RTCScheduler
+from inference.client.temporal_ensemble import TemporalEnsembleScheduler
 
 ACTION_DIM = 23
 
@@ -127,6 +130,81 @@ def test_empty_queue_yields_no_action_and_reset_clears_state():
     scheduler.reset()
     assert scheduler.tracker.max() is None
     assert scheduler.queue.empty()
+
+
+def test_temporal_ensemble_blends_overlapping_chunks():
+    worker = _FakeWorker()
+    scheduler = TemporalEnsembleScheduler(
+        worker, action_horizon=10, min_exec_horizon=2, ensemble_coeff=0.0
+    )
+
+    assert scheduler.submit_bootstrap({"prompt": "p"})
+    worker.in_flight = False
+    worker.results.append((0, _chunk(10)))
+
+    # The bootstrap chunk alone covers the first two steps.
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(0.0)
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(1.0)
+
+    # Step 2 goes out for the next chunk while the running one is still live.
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(2.0)
+    assert worker.in_flight
+
+    worker.in_flight = False
+    worker.results.append((2, _chunk(10, start=100.0)))
+
+    # Step 3 is covered by both chunks; with a zero coefficient they weigh the same.
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(
+        (3.0 + 101.0) / 2.0
+    )
+
+
+def test_temporal_ensemble_favours_the_freshest_chunk():
+    worker = _FakeWorker()
+    scheduler = TemporalEnsembleScheduler(
+        worker, action_horizon=10, min_exec_horizon=2, ensemble_coeff=0.5
+    )
+
+    scheduler.submit_bootstrap({"prompt": "p"})
+    worker.in_flight = False
+    worker.results.append((0, _chunk(10)))
+    for _ in range(3):
+        scheduler.get_action({"prompt": "p"})
+
+    worker.in_flight = False
+    worker.results.append((2, _chunk(10, start=100.0)))
+    weight_old = math.exp(-0.5 * 3)
+    weight_new = math.exp(-0.5 * 1)
+    expected = (weight_old * 3.0 + weight_new * 101.0) / (weight_old + weight_new)
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(expected)
+
+
+def test_temporal_ensemble_drops_stale_chunks_and_runs_dry():
+    worker = _FakeWorker()
+    scheduler = TemporalEnsembleScheduler(
+        worker, action_horizon=2, min_exec_horizon=100
+    )
+
+    assert scheduler.submit_bootstrap({"prompt": "p"})
+    worker.in_flight = False
+    worker.results.append((0, _chunk(2)))
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(0.0)
+    assert scheduler.get_action({"prompt": "p"})[0] == pytest.approx(1.0)
+
+    # The chunk is exhausted, so the step holds no action.
+    assert scheduler.get_action({"prompt": "p"}) is None
+    assert scheduler.observe_chunk(1, _chunk(2)) is None
+
+    scheduler.reset()
+    assert scheduler.observe_chunk(0, _chunk(2)) == 0
+
+
+def test_temporal_ensemble_requires_rtc_to_be_off():
+    pytest.importorskip("websockets")
+    from inference.client.main import main
+
+    with pytest.raises(ValueError, match="--no-rtc"):
+        main(["--temporal_ensemble"])
 
 
 def test_gripper_hysteresis_latches_above_the_close_threshold():

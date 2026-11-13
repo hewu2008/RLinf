@@ -7,6 +7,13 @@
 # refuses to start against a server that does not advertise RTC support; pass
 # --no-rtc to run whole chunks without guidance.
 #
+# This script runs with --no-rtc and --temporal_ensemble instead: the next chunk
+# is requested after --min_exec_horizon steps of the running one, and every
+# control step executes the age-weighted average of the live chunks,
+# w = exp(-ensemble_coeff * age), as in ACT. The freshest plan dominates and
+# older ones only smooth the seam. --ensemble_coeff 0 averages them equally;
+# larger values follow the newest chunk more closely.
+#
 # This side needs only inference/ plus the H1 vendor SDK, so it runs from the
 # robot's own venv, launched from the repository root:
 #   ROBOT_PYTHON=/path/to/python bash scripts/run_inference_client.sh
@@ -71,6 +78,8 @@ ${launcher} "${PYTHON}" -m inference.client.main \
   --init_frame_idx 30 \
   --control_freq 30 \
   --no-rtc \
+  --temporal_ensemble \
+  --ensemble_coeff 0.05 \
   --min_exec_horizon 18 \
   --delay_buffer_size 10 \
   --num_steps 864000 \
