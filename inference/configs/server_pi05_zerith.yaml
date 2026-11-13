@@ -41,10 +41,16 @@ openpi:
   # itself and skips the backward.
   rtc_guidance_mode: exact
   # Leading denoise steps that take the exact correction, the rest fall back to
-  # "approx"; null uses the selected mode for every step. Set 2-3 to bound the
-  # backward passes under "exact".
-  rtc_guidance_steps: null
-  # Upper clamp of the guidance weight (paper beta).
+  # "approx"; null uses the selected mode for every step. Under "exact" the
+  # Jacobian matters most near t=1, so 3 keeps the strong end of the correction
+  # and drops 7 of the 10 backward passes (~-90 ms per request).
+  rtc_guidance_steps: 3
+  # Upper clamp of the guidance weight (paper beta). It does not mean the same
+  # thing in both modes: with a leftover displaced by one normalized unit,
+  # "approx" moves the arm dims by ~0.83 rad, "exact" by ~0.15 rad (this
+  # checkpoint), because the identity Jacobian skips a factor of ~5-7. "approx"
+  # with clip=5 therefore overshoots the overlap target and shows up as a jolt
+  # at every replan on the real robot; lower the clip or use "exact".
   rtc_guidance_clip: 5.0
   # Classifier-free guidance: every denoise step mixes the plain-prompt branch
   # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the

@@ -53,6 +53,9 @@ class RTCGuidanceContext:
     prev_model_actions: torch.Tensor | None = None  # [B, H, A_model]
     executed_horizon: int = 0
     delay_steps: int = 0
+    # Physical state of the request that produced ``prev_model_actions``. Set
+    # when the leftover must be re-anchored, see :func:`reanchor_prev_actions`.
+    prev_state: torch.Tensor | None = None  # [B, S_env]
 
     def get_prev_remaining(self) -> torch.Tensor | None:
         if self.prev_model_actions is None:
@@ -110,6 +113,108 @@ def rtc_guidance_scale(paper_tau: torch.Tensor, guidance_clip: float) -> torch.T
     numerator = paper_tau * paper_tau + complement * complement
     denominator = torch.clamp(paper_tau * complement, min=1e-6)
     return torch.clamp(numerator / denominator, max=float(guidance_clip))
+
+
+@dataclass(frozen=True)
+class ActionAnchor:
+    """Per-dimension constants that move a leftover chunk to a new state anchor."""
+
+    delta_mask: torch.Tensor  # [A_model] bool, True where the action is a delta
+    action_scale: torch.Tensor  # [A_env] float, normalizer applied to deltas
+    state_mean: torch.Tensor  # [A_env] float
+    state_scale: torch.Tensor  # [A_env] float
+
+
+def reanchor_prev_actions(
+    prev_actions: torch.Tensor,
+    prev_state: torch.Tensor,
+    cur_state: torch.Tensor,
+    anchor: ActionAnchor,
+) -> torch.Tensor:
+    """Re-anchor a leftover chunk's deltas from ``prev_state`` to ``cur_state``.
+
+    ``DeltaActions`` encodes a whole chunk as ``actions - state_at_request``, and
+    the encoder normalizes per dimension. A leftover produced at an earlier state
+    therefore describes offsets from that state, while the deltas of a chunk
+    sampled now are anchored to the current one; guiding towards it unchanged
+    pulls the arm by ``cur_state - prev_state``. Adding that difference back, in
+    normalized units and on the delta dims only, gives the target the input
+    pipeline would have produced for the same absolute actions.
+
+    ``prev_state`` is physical, ``cur_state`` is already normalized by the input
+    pipeline. Dimensions past the environment state, or without a delta, keep
+    their original value.
+    """
+    dims = min(prev_state.shape[-1], anchor.action_scale.shape[-1])
+    state_scale = anchor.state_scale[:dims].to(cur_state)
+    state_mean = anchor.state_mean[:dims].to(cur_state)
+    action_scale = anchor.action_scale[:dims].to(cur_state)
+    delta_mask = anchor.delta_mask[:dims].to(cur_state.device)
+    cur_phys = cur_state[..., :dims] * state_scale + state_mean
+    shift = (prev_state[..., :dims].to(cur_phys) - cur_phys) / action_scale
+    shift = torch.where(delta_mask, shift, torch.zeros_like(shift))
+    reanchored = prev_actions.clone()
+    reanchored[..., :dims] += shift.unsqueeze(-2)
+    return reanchored
+
+
+def _iter_transforms(transform_fn):
+    """Yield the leaves of a composed openpi transform pipeline, depth first."""
+    children = getattr(transform_fn, "transforms", None)
+    if children is None:
+        yield transform_fn
+        return
+    for child in children:
+        yield from _iter_transforms(child)
+
+
+def action_anchor_from_transforms(input_fn, output_fn) -> ActionAnchor | None:
+    """Extract the delta mask and normalizers from the openpi pipelines.
+
+    Returns ``None`` when the pipeline trains absolute actions, has no
+    ``DeltaActions``, or carries no norm stats; the caller then leaves the
+    leftover anchored to the previous request, exactly as before.
+    """
+    from openpi import transforms as openpi_transforms
+
+    delta = None
+    unnormalize = None
+    for transform in _iter_transforms(input_fn):
+        if isinstance(transform, openpi_transforms.DeltaActions):
+            delta = transform
+    for transform in _iter_transforms(output_fn):
+        if isinstance(transform, openpi_transforms.Unnormalize):
+            unnormalize = transform
+    if delta is None or delta.mask is None or unnormalize is None:
+        return None
+    stats = unnormalize.norm_stats
+    if not stats or "actions" not in stats or "state" not in stats:
+        return None
+
+    def _scale_mean(key):
+        entry = stats[key]
+        if unnormalize.use_quantiles:
+            low = torch.as_tensor(entry.q01).float()
+            high = torch.as_tensor(entry.q99).float()
+            scale = (high - low + 1e-6) / 2.0
+            mean = low + scale
+        else:
+            scale = torch.as_tensor(entry.std).float() + 1e-6
+            mean = torch.as_tensor(entry.mean).float()
+        return scale, mean
+
+    action_scale, _ = _scale_mean("actions")
+    state_scale, state_mean = _scale_mean("state")
+    action_dims = action_scale.shape[0]
+    delta_mask = torch.zeros(action_dims, dtype=torch.bool)
+    mask_dims = min(len(delta.mask), action_dims)
+    delta_mask[:mask_dims] = torch.as_tensor(delta.mask, dtype=torch.bool)[:mask_dims]
+    return ActionAnchor(
+        delta_mask=delta_mask,
+        action_scale=action_scale,
+        state_mean=state_mean,
+        state_scale=state_scale,
+    )
 
 
 def _branch_velocity(

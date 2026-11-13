@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 from typing import Any, Literal, Sequence
@@ -102,6 +103,8 @@ class Pi0Eval(EnvIO, Pi0):
         # Both stay ``None`` (the eager loops) until enable_sampler_graph swaps
         # in captured CUDA graphs.
         self._rtc_denoise_fn = None
+        self._rtc_action_anchor = None
+        self._rtc_anchor_mismatch_logged = False
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
             "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
@@ -234,6 +237,60 @@ class Pi0Eval(EnvIO, Pi0):
         )
         return self.env_obs_to_observation(cond_env_obs)
 
+    def setup_transforms(
+        self,
+        transforms: Sequence,
+        output_transforms: Sequence,
+    ) -> None:
+        """Install the pipelines and cache what the RTC re-anchor needs."""
+        super().setup_transforms(transforms, output_transforms)
+        from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+            action_anchor_from_transforms,
+        )
+
+        self._rtc_action_anchor = action_anchor_from_transforms(
+            self._input_transform_fn, self._output_transform_fn
+        )
+        if self.rtc_enabled and self._rtc_action_anchor is None:
+            get_logger().warning(
+                "Pi0Eval: the action pipeline has no delta transform or norm "
+                "stats; RTC leftovers stay anchored to the previous request"
+            )
+
+    def _reanchored_context(self, rtc_context, cur_state: torch.Tensor):
+        """Move the leftover deltas from the previous request to this state."""
+        from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+            reanchor_prev_actions,
+        )
+
+        if (
+            rtc_context is None
+            or rtc_context.prev_model_actions is None
+            or rtc_context.prev_state is None
+            or self._rtc_action_anchor is None
+        ):
+            return rtc_context
+        if cur_state.shape[-1] < self._rtc_action_anchor.state_scale.shape[0]:
+            # ``state_indices`` selects a subset of the trained state, so the
+            # per-dimension stats no longer line up with the model's state.
+            if not self._rtc_anchor_mismatch_logged:
+                get_logger().warning(
+                    "Pi0Eval: the model state has %d dims but the norm stats "
+                    "cover %d; RTC leftovers stay anchored to the previous "
+                    "request",
+                    cur_state.shape[-1],
+                    self._rtc_action_anchor.state_scale.shape[0],
+                )
+                self._rtc_anchor_mismatch_logged = True
+            return rtc_context
+        prev_actions = reanchor_prev_actions(
+            rtc_context.prev_model_actions,
+            rtc_context.prev_state,
+            cur_state,
+            self._rtc_action_anchor,
+        )
+        return dataclasses.replace(rtc_context, prev_model_actions=prev_actions)
+
     def _predict_eval_with_rtc(
         self,
         observation,
@@ -247,6 +304,7 @@ class Pi0Eval(EnvIO, Pi0):
             sample_actions_with_rtc_guidance,
         )
 
+        rtc_context = self._reanchored_context(rtc_context, observation.state)
         model_actions = sample_actions_with_rtc_guidance(
             self,
             observation,

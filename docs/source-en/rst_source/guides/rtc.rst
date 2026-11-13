@@ -22,6 +22,7 @@ RTC uses **soft overlap guidance** to smooth chunk boundaries, following Algorit
 - **Hard mask**: the first ``delay_steps`` positions, forced to match the old chunk's remaining actions.
 - **Soft mask**: subsequent steps, guided toward the new chunk's predictions with exponential decay.
 - The residual is measured against the one-step estimate ``x1 = x - t v`` and applied with weight ``min(clip, (τ² + (1-τ)²) / (τ(1-τ)))`` as ``x ← x - dt·v + dt·w·correction``.
+- Delta actions are anchored to the state of the request that produced them. When the previous request's state travels with the leftover (``RTCGuidanceContext.prev_state``, which the inference server fills from its session), the leftover is re-anchored to the current state on the delta dims before it becomes the target; otherwise every replan pulls the arm by the state difference.
 - ``rtc_guidance_mode`` picks the correction: ``approx`` uses the residual itself (identity Jacobian), ``exact`` computes the PiGDM ``(I - t ∂v/∂x)ᵀ`` correction with autograd (one extra backward pass per step). Both run from a captured CUDA graph, backward kernels included. ``rtc_guidance_steps`` applies the exact correction to a leading number of steps only, which bounds the backward passes.
 
 Simulation Experiment

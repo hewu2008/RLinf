@@ -22,6 +22,7 @@ RTC 使用 ``软重叠引导``\ （soft overlap guidance）来平滑 chunk 边�
 - ``硬掩码`` （hard mask）：前 ``delay_steps`` 步，强制使用旧 chunk 的剩余动作。
 - ``软掩码`` （soft mask）：后续若干步，通过指数衰减引导新 chunk 逐渐过渡到其自身预测。
 - 残差按一步到位估计 ``x1 = x - t v`` 计算，权重为 ``min(clip, (τ² + (1-τ)²) / (τ(1-τ)))``，并按 ``x ← x - dt·v + dt·w·correction`` 应用。
+- delta 动作以「产生它的那次请求的 state」为锚点。若上一请求的 state 随 leftover 一起传入（``RTCGuidanceContext.prev_state``，推理服务会从 session 中自动填），残差目标会先在 delta 维度上重新锚定到当前 state；否则每次 replan 都会按两次请求的状态差把机械臂拉偏。
 - ``rtc_guidance_mode`` 选择修正项：``approx`` 直接用残差（恒等 Jacobian），``exact`` 用 autograd 计算 PiGDM 的 ``(I - t ∂v/∂x)ᵀ`` 修正（每步多一次反向）。两者都能被 CUDA graph 捕获（反向内核也在图内）。``rtc_guidance_steps`` 可只让前若干步走精确修正，用它限制反向次数。
 
 仿真实验

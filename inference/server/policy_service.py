@@ -52,9 +52,12 @@ class RTCSession:
     ``model_actions`` is the previous chunk in model action space (the padded
     and normalized 32-D layout), which is what ``RTCGuidanceContext`` reads; the
     decoded 23-D chunk sent over the wire cannot serve as the reference.
+    ``state`` is the physical state of that request: the chunk's deltas are
+    anchored to it, so the next replan re-anchors them to the current state.
     """
 
     model_actions: torch.Tensor | None = None
+    state: torch.Tensor | None = None
     chunk_id: int = 0
 
 
@@ -223,6 +226,7 @@ class PolicyService:
         model_actions = result.get("model_actions")
         if model_actions is not None:
             session.model_actions = model_actions.detach().to("cpu").contiguous()
+        session.state = torch.as_tensor(env_obs["states"], dtype=torch.float32).clone()
         session.chunk_id = chunk_id
 
         chunk = actions.detach().to("cpu", dtype=torch.float32).numpy()[0]
@@ -275,4 +279,5 @@ class PolicyService:
             prev_model_actions=session.model_actions,
             executed_horizon=int(payload["executed_horizon"]),
             delay_steps=int(payload["predicted_delay_steps"]),
+            prev_state=session.state,
         )

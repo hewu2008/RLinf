@@ -1709,6 +1709,81 @@ def test_rtc_exact_guidance_differentiates_the_mixed_velocity():
     torch.testing.assert_close(sample("exact"), sample("approx"))
 
 
+def test_rtc_reanchor_moves_the_leftover_onto_the_current_state():
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        ActionAnchor,
+        reanchor_prev_actions,
+    )
+
+    anchor = ActionAnchor(
+        delta_mask=torch.tensor([True, True, False]),
+        action_scale=torch.tensor([0.5, 0.25, 0.25]),
+        state_mean=torch.zeros(3),
+        state_scale=torch.tensor([2.0, 1.0, 1.0]),
+    )
+    prev_actions = torch.zeros(1, 2, 3)
+    # The previous request was 0.2 rad ahead on dim 0 (a delta: the target must
+    # absorb it) and on dim 2 (absolute: the target must not move).
+    prev_state = torch.tensor([[0.2, 0.0, 0.2]])
+    cur_state = torch.zeros(1, 3)  # normalized state of this request
+
+    reanchored = reanchor_prev_actions(prev_actions, prev_state, cur_state, anchor)
+
+    torch.testing.assert_close(reanchored[0, :, 0], torch.full((2,), 0.4))
+    torch.testing.assert_close(reanchored[0, :, 1], torch.zeros(2))
+    torch.testing.assert_close(reanchored[0, :, 2], torch.zeros(2))
+    # The caller keeps its buffer: the sampler copies the target into its own.
+    torch.testing.assert_close(prev_actions, torch.zeros(1, 2, 3))
+
+
+def test_rtc_action_anchor_reads_the_openpi_pipeline():
+    transforms = pytest.importorskip("openpi.transforms")
+    normalize = pytest.importorskip("openpi.shared.normalize")
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        action_anchor_from_transforms,
+    )
+
+    stats = {
+        "actions": normalize.NormStats(
+            mean=np.zeros(3, dtype=np.float32),
+            std=np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        ),
+        "state": normalize.NormStats(
+            mean=np.array([0.5, 0.0, 0.0], dtype=np.float32),
+            std=np.array([2.0, 1.0, 1.0], dtype=np.float32),
+        ),
+    }
+    input_fn = transforms.compose([transforms.DeltaActions([True, False, True])])
+    output_fn = transforms.compose([transforms.Unnormalize(norm_stats=stats)])
+
+    anchor = action_anchor_from_transforms(input_fn, output_fn)
+
+    assert anchor is not None
+    assert anchor.delta_mask.tolist() == [True, False, True]
+    torch.testing.assert_close(
+        anchor.action_scale, torch.tensor([1.0, 2.0, 3.0]) + 1e-6
+    )
+    torch.testing.assert_close(anchor.state_mean, torch.tensor([0.5, 0.0, 0.0]))
+    torch.testing.assert_close(anchor.state_scale, torch.tensor([2.0, 1.0, 1.0]) + 1e-6)
+    # No norm stats (or no delta transform) means the leftover is left alone.
+    assert action_anchor_from_transforms(input_fn, transforms.compose([])) is None
+
+
+def test_rtc_session_carries_the_previous_state_into_the_context():
+    from inference.server.policy_service import PolicyService, RTCSession
+
+    state = torch.ones(1, 23)
+    session = RTCSession(model_actions=torch.zeros(1, 2, 32), state=state)
+
+    context = PolicyService._build_rtc_context(
+        session, {"executed_horizon": 4, "predicted_delay_steps": 2}
+    )
+
+    assert context.prev_state is state
+    assert context.executed_horizon == 4
+    assert context.delay_steps == 2
+
+
 def test_rtc_denoise_loop_matches_the_cfg_mix():
     plain = _cfg_observation(0.0)
     advantage = _cfg_observation(1.0)
