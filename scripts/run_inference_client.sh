@@ -10,8 +10,8 @@
 # This side needs only inference/ plus the H1 vendor SDK, so it runs from the
 # robot's own venv, launched from the repository root:
 #   ROBOT_PYTHON=/path/to/python bash scripts/run_inference_client.sh
-# Point H1_SDK_DIR (or --sdk_dir) at the directory holding lib_h1_sdk_python and
-# camera_client; without either, client/lib is used.
+# The SDK path is fixed in the client: h1_robot._ensure_sdk_on_path resolves it
+# to inference/client/lib, so it is not passed on the command line.
 # Client deps: pip install -r inference/requirements.txt
 #
 # The motors are driven through sudo by default. sudo resets PATH, so the
@@ -66,7 +66,6 @@ fi
 ${launcher} "${PYTHON}" -m inference.client.main \
   --host "${HOST:-172.31.200.200}" \
   --port "${PORT:-55555}" \
-  --sdk_dir "${H1_SDK_DIR:-inference/client/lib}" \
   --prompt "Sort all objects into the correct bins using both arms" \
   --init_hdf5 /data/zerith_data/1_clear_the_bin_box_20261027/04742e2eb140434d87b5b8d213741c1e/episode.hdf5 \
   --control_freq 30 \
