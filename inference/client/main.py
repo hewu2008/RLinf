@@ -30,6 +30,7 @@ import numpy as np
 
 from inference.client.async_infer import InferenceWorker
 from inference.client.control_loop import run_control_loop
+from inference.client.gripper_hysteresis import GripperHysteresis
 from inference.client.h1_robot import DEFAULT_CAMERA_NAMES, H1RobotEnv
 from inference.client.policy_client import WebsocketPolicyClient
 from inference.client.rtc_scheduler import RTCScheduler
@@ -100,9 +101,9 @@ def load_reference_state(path: str, frame_index: int) -> np.ndarray:
     return np.asarray(states[frame_index], dtype=np.float64)
 
 
-def postprocess_action(action: np.ndarray) -> np.ndarray:
-    """Single hook for robot-side action shaping (identity in this version)."""
-    return action
+def postprocess_action(action: np.ndarray, gripper: GripperHysteresis) -> np.ndarray:
+    """Single hook for robot-side action shaping."""
+    return gripper.apply(action)
 
 
 def warm_up(
@@ -253,6 +254,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     worker = InferenceWorker(client)
+    gripper = GripperHysteresis()
     scheduler = RTCScheduler(
         worker,
         action_horizon=action_horizon,
@@ -279,7 +281,7 @@ def main(argv: list[str] | None = None) -> None:
             env.set_joint_action(state[: env.motor_count])
             return False
 
-        env.set_joint_action(postprocess_action(np.copy(action))[:-2])
+        env.set_joint_action(postprocess_action(np.copy(action), gripper)[:-2])
 
         result_age = worker.last_result_age()
         if result_age is not None and result_age > args.watchdog_timeout:

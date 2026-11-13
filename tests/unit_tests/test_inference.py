@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from inference import protocol
+from inference.client.gripper_hysteresis import CLOSED_VALUE, GripperHysteresis
 from inference.client.h1_robot import camera_source_candidates, motor_position
 from inference.client.rtc_scheduler import RTCScheduler
 
@@ -45,6 +46,12 @@ class _FakeWorker:
 def _chunk(horizon: int, *, start: float = 0.0) -> np.ndarray:
     values = np.arange(start, start + horizon, dtype=np.float32)
     return np.repeat(values[:, None], ACTION_DIM, axis=1)
+
+
+def _action_with_grippers(left: float, right: float) -> np.ndarray:
+    action = np.zeros(ACTION_DIM, dtype=np.float32)
+    action[[7, 15]] = (left, right)
+    return action
 
 
 def test_bootstrap_then_replan_skips_the_inflight_prefix():
@@ -115,6 +122,61 @@ def test_empty_queue_yields_no_action_and_reset_clears_state():
     scheduler.reset()
     assert scheduler.tracker.max() is None
     assert scheduler.queue.empty()
+
+
+def test_gripper_hysteresis_latches_above_the_close_threshold():
+    gripper = GripperHysteresis()
+    action = _action_with_grippers(0.6, 0.1)
+
+    gripper.apply(action)
+
+    assert action[7] == pytest.approx(CLOSED_VALUE)
+    assert action[15] == pytest.approx(0.1)
+    assert action[0] == pytest.approx(0.0)
+
+
+def test_gripper_hysteresis_holds_between_thresholds_and_reopens_below_open():
+    gripper = GripperHysteresis()
+    gripper.apply(_action_with_grippers(0.6, 0.6))
+
+    inside = _action_with_grippers(0.3, 0.3)
+    gripper.apply(inside)
+    assert inside[7] == pytest.approx(CLOSED_VALUE)
+    assert inside[15] == pytest.approx(CLOSED_VALUE)
+
+    below = _action_with_grippers(0.1, 0.1)
+    gripper.apply(below)
+    assert below[7] == pytest.approx(0.1)
+    assert below[15] == pytest.approx(0.1)
+
+
+def test_gripper_hysteresis_debounces_and_resets_its_latches():
+    gripper = GripperHysteresis(close_steps=2, open_steps=2)
+
+    first = _action_with_grippers(0.6, 0.6)
+    gripper.apply(first)
+    assert first[7] == pytest.approx(0.6)  # one step does not latch yet
+
+    second = _action_with_grippers(0.6, 0.6)
+    gripper.apply(second)
+    assert second[7] == pytest.approx(CLOSED_VALUE)
+
+    dip = _action_with_grippers(0.1, 0.1)
+    gripper.apply(dip)
+    assert dip[7] == pytest.approx(CLOSED_VALUE)  # one step does not reopen yet
+
+    gripper.reset()
+    after = _action_with_grippers(0.6, 0.6)
+    gripper.apply(after)
+    assert after[7] == pytest.approx(0.6)  # both the latch and its counters are gone
+
+
+def test_gripper_hysteresis_rejects_bad_thresholds_and_short_actions():
+    with pytest.raises(ValueError, match="close_threshold"):
+        GripperHysteresis(close_threshold=0.2, open_threshold=0.45)
+
+    with pytest.raises(ValueError, match="expected a 16-D action"):
+        GripperHysteresis().apply(np.zeros(8, dtype=np.float32))
 
 
 def test_rtc_payload_is_normalized_and_version_checked():
