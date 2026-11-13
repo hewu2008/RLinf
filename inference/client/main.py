@@ -358,13 +358,22 @@ def main(argv: list[str] | None = None) -> None:
         if recorder is not None:
             recorder.mark_homing()
         logger.info("returning home over %d steps", steps)
+        deadline = time.monotonic()
         for step in range(steps):
             alpha = (step + 1) / steps
             joints = (1.0 - alpha) * start + alpha * np.asarray(target, np.float64)
             env.set_joint_action(joints)
             if recorder is not None:
                 record_commanded(env.get_observation(), joints)
-            time.sleep(period)
+            deadline += period
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            else:
+                # A late step is dropped rather than replayed back to back: bursting
+                # through the schedule would jump the joint targets and jerk the arms.
+                logger.warning("return-home overrun: %.1f ms late", -remaining * 1000)
+                deadline = time.monotonic()
 
     def start_episode() -> bool:
         """Request the first chunk of an episode."""
