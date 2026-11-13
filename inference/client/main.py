@@ -335,6 +335,21 @@ def main(argv: list[str] | None = None) -> None:
             np.asarray(observation["qpos"]), action, observation["images"]
         )
 
+    def home_target() -> np.ndarray:
+        """Joint target of the return-home move, preferring the episode's start pose."""
+        if reference is not None:
+            logger.info(
+                "returning to the reference pose from %s frame %d",
+                args.init_hdf5,
+                args.init_frame_idx,
+            )
+            return np.asarray(reference[: env.motor_count], dtype=np.float64)
+        logger.warning(
+            "no --init_hdf5 reference; returning to the zero pose with the current "
+            "lift height"
+        )
+        return env.init_pose_target()
+
     def return_home(target: np.ndarray) -> None:
         """Drive the joints to ``target`` at the control rate, recording every step."""
         start = np.asarray(env.get_joint_position(), dtype=np.float64)
@@ -365,11 +380,7 @@ def main(argv: list[str] | None = None) -> None:
 
     def finish_episode() -> None:
         """Drive home while recording, save the episode, then hand the terminal over."""
-        return_home(
-            reference[: env.motor_count]
-            if reference is not None
-            else env.init_pose_target()
-        )
+        return_home(home_target())
         if recorder is not None:
             try:
                 recorder.save(args.save_dir)
