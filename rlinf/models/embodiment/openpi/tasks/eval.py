@@ -179,9 +179,14 @@ class Pi0Eval(EnvIO, Pi0):
         and the camera layout, so changing ``max_token_len``,
         ``num_action_chunks``, ``num_steps`` or the camera resolution
         re-captures. Capture happens on the first call of each path, which the
-        server warmup covers. The RTC loop is left eager when
-        ``rtc_guidance_mode`` is ``exact``: its autograd pass cannot be replayed
-        from a recorded graph.
+        server warmup covers.
+
+        ``rtc_guidance_mode="exact"`` is captured too: a graph records the
+        backward kernels of every guided step, and the replay was measured
+        bit-identical to the eager loop on the deployed Pi0.5. What the graph
+        cannot remove is the backward arithmetic, so the exact correction still
+        costs one extra backward pass per guided step; ``rtc_guidance_steps``
+        bounds how many steps pay it.
         """
         from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
             LoopGraphSampler,
@@ -195,21 +200,12 @@ class Pi0Eval(EnvIO, Pi0):
             )
             return
         self._plain_denoise_fn = LoopGraphSampler(euler_denoise_loop)
-        if self.rtc_guidance_mode == "exact":
-            # The exact PiGDM correction runs autograd inside the loop; a
-            # captured graph replays the recorded kernels without the backward
-            # pass, so the RTC path stays eager in this mode.
-            self._rtc_denoise_fn = None
-            get_logger().info(
-                "Pi0Eval: the plain sampler runs from a captured CUDA graph; "
-                "the RTC loop stays eager because rtc_guidance_mode=exact "
-                "needs autograd"
-            )
-            return
         self._rtc_denoise_fn = LoopGraphSampler(rtc_denoise_loop)
         get_logger().info(
-            "Pi0Eval: plain and RTC samplers run from captured CUDA graphs; "
-            "the first call of each captures it"
+            "Pi0Eval: plain and RTC samplers run from captured CUDA graphs "
+            "(rtc mode=%s guidance_steps=%s); the first call of each captures it",
+            self.rtc_guidance_mode,
+            "all" if self.rtc_guidance_steps is None else self.rtc_guidance_steps,
         )
 
     def disable_sampler_graph(self) -> None:

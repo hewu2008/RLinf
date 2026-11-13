@@ -19,14 +19,18 @@ protocol used by both ``openpi`` and the leftover OpenPI PyTorch
 sampler; the Euler loop below is the vendored-Pi0 implementation of
 Algorithm 1 from "Real-Time Execution of Action Chunking Flow Policies".
 
-Two guidance modes are available:
+Two guidance modes are available, both servable from a captured CUDA graph:
 
 ``approx``
-    Identity Jacobian (``correction = err``). No backward pass, so the loop can
-    still be served from a captured CUDA graph. This is the legacy behaviour.
+    Identity Jacobian (``correction = err``), no backward pass. The residual is
+    applied as is; this is not bit-identical to the loop from before the exact
+    mode existed, which measured the residual against ``x_t_mean`` and did not
+    scale it by ``dt``.
 ``exact``
     The PiGDM vector-Jacobian product ``(I - t d v / d x)^T err`` of Eq. (pigdm1),
-    computed with autograd through the suffix forward.
+    computed with autograd through the suffix forward. A graph records the
+    backward kernels as well, and the replay matches the eager loop bit for bit
+    (measured on the deployed Pi0.5); the cost is the backward arithmetic.
 """
 
 from __future__ import annotations
@@ -150,9 +154,10 @@ def rtc_denoise_loop(
     shape that depends only on the model config (batch, ``action_horizon``,
     ``action_dim``, prefix length), nothing synchronizes with the host, and
     nothing branches on a tensor value. Keep it that way - a host copy, a
-    ``.item()`` or a tensor-dependent ``if`` invalidates the capture. The
-    ``guidance_mode="exact"`` path is the exception: it runs autograd and is
-    therefore served eagerly (see ``Pi0Eval.enable_sampler_graph``).
+    ``.item()`` or a tensor-dependent ``if`` invalidates the capture.
+    ``guidance_mode="exact"`` keeps that contract: the autograd pass runs at
+    capture time and its backward kernels are recorded like any other,
+    replaying without the CPU-side graph walk.
 
     Args:
         pi0_model: the Pi0 / Pi0Eval model providing the prefix cache and suffix
@@ -171,7 +176,7 @@ def rtc_denoise_loop(
             ``(1 - cfg_scale) * v + cfg_scale * v_cond``.
         guidance_mode: ``"approx"`` corrects with the residual itself (identity
             Jacobian, no backward pass); ``"exact"`` corrects with the PiGDM
-            vector-Jacobian product of Eq. (pigdm1).
+            vector-Jacobian product of Eq. (pigdm1), one backward per step.
         guidance_steps: number of leading denoise steps served with the exact
             correction; the rest fall back to ``"approx"``. ``None`` applies the
             selected mode to every step.
@@ -374,9 +379,12 @@ class LoopGraphSampler:
 
     The graph records the eager kernels, so a replay returns the same action
     bits as the eager loop; what disappears is the per-step launch overhead,
-    which dominates a batch-of-one chunk. Inputs are copied into static buffers
-    that are kept alive for the lifetime of the sampler, so the caller may keep
-    the returned chunk without observing a later request overwrite it.
+    which dominates a batch-of-one chunk. The recorded sequence includes the
+    backward kernels of an autograd-guided loop (``guidance_mode="exact"``),
+    so that mode replays too instead of falling back to eager. Inputs are
+    copied into static buffers that are kept alive for the lifetime of the
+    sampler, so the caller may keep the returned chunk without observing a
+    later request overwrite it.
 
     ``torch.compile`` would also remove the launches but reorders and refolds
     the arithmetic (measured up to 1.7e-2 absolute drift on a 50-step chunk),

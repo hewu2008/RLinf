@@ -34,12 +34,15 @@ openpi:
   # this is false.
   rtc_enabled: true
   # "exact" is the PiGDM correction (I - t dv/dx)^T err of the paper, one backward
-  # pass per denoise step; the RTC loop then runs eagerly because a captured CUDA
-  # graph cannot replay autograd. "approx" corrects with err itself: no backward
-  # pass, keeps the graph.
+  # pass per denoise step. Those backward kernels are captured and replayed with
+  # the rest of the loop (measured bit-identical on this checkpoint), so the
+  # graph is kept; the remaining cost is the backward arithmetic itself, about
+  # +130 ms of a 475 ms request versus "approx". "approx" corrects with err
+  # itself and skips the backward.
   rtc_guidance_mode: exact
   # Leading denoise steps that take the exact correction, the rest fall back to
-  # "approx"; null uses the selected mode for every step.
+  # "approx"; null uses the selected mode for every step. Set 2-3 to bound the
+  # backward passes under "exact".
   rtc_guidance_steps: null
   # Upper clamp of the guidance weight (paper beta).
   rtc_guidance_clip: 5.0

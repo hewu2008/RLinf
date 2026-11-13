@@ -22,7 +22,7 @@ RTC uses **soft overlap guidance** to smooth chunk boundaries, following Algorit
 - **Hard mask**: the first ``delay_steps`` positions, forced to match the old chunk's remaining actions.
 - **Soft mask**: subsequent steps, guided toward the new chunk's predictions with exponential decay.
 - The residual is measured against the one-step estimate ``x1 = x - t v`` and applied with weight ``min(clip, (τ² + (1-τ)²) / (τ(1-τ)))`` as ``x ← x - dt·v + dt·w·correction``.
-- ``rtc_guidance_mode`` picks the correction: ``approx`` uses the residual itself (identity Jacobian, CUDA-graph friendly), ``exact`` computes the PiGDM ``(I - t ∂v/∂x)ᵀ`` correction with autograd (one extra backward pass per step, served eagerly). ``rtc_guidance_steps`` applies the exact correction to a leading number of steps only.
+- ``rtc_guidance_mode`` picks the correction: ``approx`` uses the residual itself (identity Jacobian), ``exact`` computes the PiGDM ``(I - t ∂v/∂x)ᵀ`` correction with autograd (one extra backward pass per step). Both run from a captured CUDA graph, backward kernels included. ``rtc_guidance_steps`` applies the exact correction to a leading number of steps only, which bounds the backward passes.
 
 Simulation Experiment
 ---------------------
@@ -310,7 +310,7 @@ RTC parameters are split across two locations:
      - Use Hydra reference ``${runner.rtc.enabled}`` to keep in sync. When enabled, the model's output action chunk references the previous chunk's remaining actions.
    * - ``rtc_guidance_mode``
      - ``"approx"``
-     - Guidance mode: ``"approx"`` uses the identity-Jacobian correction (no backward pass, CUDA-graph friendly); ``"exact"`` uses the PiGDM vector-Jacobian correction (one extra backward pass per step, the RTC loop then runs eagerly).
+     - Guidance mode: ``"approx"`` uses the identity-Jacobian correction (no backward pass); ``"exact"`` uses the PiGDM vector-Jacobian correction (one extra backward pass per step). Both replay from a captured CUDA graph, so ``"exact"`` only pays for the backward arithmetic.
    * - ``rtc_guidance_steps``
      - ``null``
      - Number of leading steps that take the selected correction; the rest fall back to ``"approx"``. ``null`` uses the selected mode for every step. A small value bounds the backward passes under ``"exact"``.

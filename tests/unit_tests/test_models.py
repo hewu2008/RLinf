@@ -1647,6 +1647,67 @@ def test_rtc_exact_guidance_uses_the_pigdm_jacobian():
     torch.testing.assert_close(sample("exact"), -torch.ones(1, 1, 1))
     torch.testing.assert_close(sample("exact", guidance_steps=0), torch.ones(1, 1, 1))
 
+    with pytest.raises(ValueError, match="guidance_mode"):
+        rtc_denoise_loop(
+            model,
+            observation,
+            None,
+            rl_sampler.get_timesteps(1, torch.device("cpu")),
+            torch.zeros(1, 1, 1),
+            target,
+            mask,
+            num_steps=1,
+            guidance_clip=1.0,
+            cfg_scale=0.0,
+            guidance_mode="paper",
+        )
+
+
+class _OpposedVelocityPi0:
+    """Velocity ``+2x`` on the plain branch and ``-2x`` on the conditioned one."""
+
+    action_horizon = 1
+    action_dim = 1
+    _plain_denoise_fn = None
+
+    def build_prefix_cache(self, observation):
+        sign = 1.0 if float(observation.state[0, 0]) < 0.5 else -1.0
+        cache = torch.full((1, 1, 1), sign)
+        return None, torch.ones(1, 1, dtype=torch.bool), ((cache, cache),)
+
+    def run_suffix(self, observation, x_t, t_tensor, kv_cache, prefix_mask):
+        del observation, t_tensor, prefix_mask
+        return kv_cache[0][0] * 2.0 * x_t
+
+    def velocity_from_suffix(self, suffix_out_act):
+        return suffix_out_act
+
+
+def test_rtc_exact_guidance_differentiates_the_mixed_velocity():
+    """The PiGDM term must use the CFG-mixed velocity, not each branch alone."""
+    model = _OpposedVelocityPi0()
+    timesteps = rl_sampler.get_timesteps(1, torch.device("cpu"))
+
+    def sample(mode):
+        return rtc_denoise_loop(
+            model,
+            _cfg_observation(0.0),
+            _cfg_observation(1.0),
+            timesteps,
+            torch.full((1, 1, 1), 0.3),
+            torch.ones(1, 1, 1),
+            torch.ones(1, 1, 1),
+            num_steps=1,
+            guidance_clip=1.0,
+            cfg_scale=0.5,
+            guidance_mode=mode,
+        )
+
+    # With beta = 0.5 the two branches cancel, so the mixed velocity and its
+    # Jacobian are both zero and the exact correction is the residual itself.
+    # Correcting each branch separately and averaging would yield -0.7 instead.
+    torch.testing.assert_close(sample("exact"), sample("approx"))
+
 
 def test_rtc_denoise_loop_matches_the_cfg_mix():
     plain = _cfg_observation(0.0)
