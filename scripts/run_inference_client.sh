@@ -17,6 +17,11 @@
 # HOST and PORT say where the policy server listens; they must match how it was
 # started (scripts/run_inference_server.sh reads the same two variables).
 #
+# Press ``r`` during the run to end the current episode: the client writes
+# rollouts/<episode_id>/episode.hdf5 in the layout of the mocap dataset, then
+# drops into pdb so the scene can be reset; type ``c`` to start the next episode.
+# Pass --no-record to run without writing files.
+#
 # prompt1: Pick and place the door handle into the left bin and the L-shaped bent pipe into the right bin
 # hdf5: 002e81207a19441bae7f4653ad759d7c
 #
@@ -36,4 +41,7 @@ cd "$(dirname "$0")/.."
   --control_freq 30 \
   --min_exec_horizon 18 \
   --delay_buffer_size 8 \
-  --num_steps 864000
+  --num_steps 864000 \
+  --save_dir rollouts \
+  --task_name clear_the_bin_box \
+  --task_id 1

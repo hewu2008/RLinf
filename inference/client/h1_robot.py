@@ -47,6 +47,13 @@ STATE_DIM = (
     23  # The joint vector plus two base-velocity slots the robot does not command.
 )
 
+ARM_JOINT_SLICES = (slice(0, 7), slice(8, 15))
+GRIPPER_INDICES = (7, 15)
+WAIST_SLICE = slice(16, 19)
+HEAD_SLICE = slice(19, 21)
+BASE_SLICE = slice(21, 23)
+"""Slices of the 23-D state and action that name the same joints the dataset stores."""
+
 FRAME_POLL_INTERVAL_SECONDS = 0.01
 
 

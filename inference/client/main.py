@@ -25,14 +25,16 @@ import argparse
 import logging
 import pdb
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from inference.client.async_infer import InferenceWorker
 from inference.client.control_loop import run_control_loop
+from inference.client.episode_recorder import EpisodeRecorder
 from inference.client.gripper_hysteresis import GripperHysteresis
-from inference.client.h1_robot import DEFAULT_CAMERA_NAMES, H1RobotEnv
+from inference.client.h1_robot import DEFAULT_CAMERA_NAMES, STATE_DIM, H1RobotEnv
+from inference.client.keyboard import KeyPressListener
 from inference.client.policy_client import WebsocketPolicyClient
 from inference.client.rtc_scheduler import RTCScheduler
 from inference.protocol import encode_frame
@@ -44,14 +46,13 @@ FIRST_CHUNK_TIMEOUT_SECONDS = 30.0
 
 
 def build_request(
-    env,
+    observation: Mapping[str, Any],
     camera_names: Sequence[str],
     *,
     prompt: str,
     jpeg_quality: int,
 ) -> dict[str, Any]:
-    """Read one robot observation and turn it into a wire request."""
-    observation = env.get_observation()
+    """Turn one robot observation into a wire request."""
     images = observation["images"]
     missing = [name for name in camera_names if name not in images]
     if missing:
@@ -120,7 +121,12 @@ def warm_up(
     for step in range(steps):
         start = time.monotonic()
         client.infer(
-            build_request(env, camera_names, prompt=prompt, jpeg_quality=jpeg_quality)
+            build_request(
+                env.get_observation(),
+                camera_names,
+                prompt=prompt,
+                jpeg_quality=jpeg_quality,
+            )
         )
         logger.info(
             "warmup %d/%d done in %.2fs", step + 1, steps, time.monotonic() - start
@@ -214,6 +220,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--deinit", action="store_true", help="release the robot when the loop finishes"
     )
+    parser.add_argument(
+        "--no-record",
+        dest="record",
+        action="store_false",
+        default=True,
+        help="do not write one hdf5 file per episode",
+    )
+    parser.add_argument(
+        "--save_dir",
+        default="rollouts",
+        help="root directory of the recorded episodes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--record_jpeg_quality",
+        type=int,
+        default=60,
+        help="JPEG quality of the recorded frames, matching the dataset",
+    )
+    parser.add_argument(
+        "--task_name",
+        default="rollout",
+        help="task name stored in the episode metadata",
+    )
+    parser.add_argument(
+        "--task_id", type=int, default=0, help="task id stored in the episode metadata"
+    )
     return parser.parse_args(argv)
 
 
@@ -269,10 +301,70 @@ def main(argv: list[str] | None = None) -> None:
         initial_delay_steps=args.initial_delay_steps,
         rtc_enabled=args.rtc,
     )
+    keys = KeyPressListener()
+    recorder = None
+    if args.record:
+        if action_dim != STATE_DIM:
+            raise ValueError(
+                f"recording expects the {STATE_DIM}-D robot action space, the "
+                f"server reports {action_dim}"
+            )
+        recorder = EpisodeRecorder(
+            camera_names=args.camera_names,
+            task_name=args.task_name,
+            task_id=args.task_id,
+            control_frequency=args.control_freq,
+            jpeg_quality=args.record_jpeg_quality,
+        )
+    episode = {"index": 1, "steps": 0}
+
+    def start_episode() -> bool:
+        """Request the first chunk of an episode."""
+        scheduler.submit_bootstrap(
+            build_request(
+                env.get_observation(),
+                args.camera_names,
+                prompt=args.prompt,
+                jpeg_quality=args.jpeg_quality,
+            )
+        )
+        return worker.wait_for_first_result(args.first_chunk_timeout)
+
+    def finish_episode() -> None:
+        """Save the episode, hand the terminal to the operator, then restart."""
+        if recorder is not None:
+            try:
+                recorder.save(args.save_dir)
+            except Exception as error:
+                logger.error("saving the episode failed: %s", error)
+            recorder.reset()
+        keys.stop()
+        logger.info(
+            "episode %d ended after %d steps; reset the scene, then type ``c`` "
+            "to start the next one",
+            episode["index"],
+            episode["steps"],
+        )
+        pdb.set_trace()
+        keys.start()
+        worker.drain()
+        scheduler.reset()
+        gripper.reset()
+        episode["index"] += 1
+        episode["steps"] = 0
+        if not start_episode():
+            raise RuntimeError(
+                f"no action chunk for episode {episode['index']} after "
+                f"{args.first_chunk_timeout:.0f}s; check the server logs"
+            )
 
     def control_step(step: int) -> bool:
+        observation = env.get_observation()
         request = build_request(
-            env, args.camera_names, prompt=args.prompt, jpeg_quality=args.jpeg_quality
+            observation,
+            args.camera_names,
+            prompt=args.prompt,
+            jpeg_quality=args.jpeg_quality,
         )
         state = np.asarray(request["state"])
         if state.shape[0] != action_dim:
@@ -285,26 +377,29 @@ def main(argv: list[str] | None = None) -> None:
         if action is None:
             logger.warning("step %d: no action queued, holding the current pose", step)
             env.set_joint_action(state[: env.motor_count])
-            return False
+        else:
+            commanded = postprocess_action(np.copy(action), gripper)[:-2]
+            env.set_joint_action(commanded)
+            if recorder is not None:
+                # Record what reached the motors; the base slots are never commanded.
+                recorded = np.zeros(action_dim)
+                recorded[: env.motor_count] = commanded
+                recorder.add_step(state, recorded, observation["images"])
 
-        env.set_joint_action(postprocess_action(np.copy(action), gripper)[:-2])
+            result_age = worker.last_result_age()
+            if result_age is not None and result_age > args.watchdog_timeout:
+                logger.error("inference stalled for %.1fs", result_age)
 
-        result_age = worker.last_result_age()
-        if result_age is not None and result_age > args.watchdog_timeout:
-            logger.error("inference stalled for %.1fs", result_age)
+        episode["steps"] += 1
+        if keys.poll() == "r":
+            finish_episode()
+            return True
         return False
 
     try:
         worker.start()
-        scheduler.submit_bootstrap(
-            build_request(
-                env,
-                args.camera_names,
-                prompt=args.prompt,
-                jpeg_quality=args.jpeg_quality,
-            )
-        )
-        if not worker.wait_for_first_result(args.first_chunk_timeout):
+        keys.start()
+        if not start_episode():
             raise RuntimeError(
                 f"no action chunk after {args.first_chunk_timeout:.0f}s; "
                 "check the server logs"
@@ -314,6 +409,7 @@ def main(argv: list[str] | None = None) -> None:
             control_step, frequency=args.control_freq, num_steps=args.num_steps
         )
     finally:
+        keys.stop()
         worker.stop()
         stats = worker.stats()
         if stats is not None:

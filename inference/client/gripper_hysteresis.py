@@ -20,8 +20,7 @@ from typing import Sequence
 
 import numpy as np
 
-GRIPPER_CHANNELS = (7, 15)
-"""Gripper slots of the 23-D action: left arm 0-6, its gripper at 7, right gripper at 15."""
+from inference.client.h1_robot import GRIPPER_INDICES
 
 CLOSE_THRESHOLD = 0.45
 OPEN_THRESHOLD = 0.2
@@ -47,7 +46,7 @@ class GripperHysteresis:
     def __init__(
         self,
         *,
-        channels: Sequence[int] = GRIPPER_CHANNELS,
+        channels: Sequence[int] = GRIPPER_INDICES,
         close_threshold: float = CLOSE_THRESHOLD,
         open_threshold: float = OPEN_THRESHOLD,
         closed_value: float = CLOSED_VALUE,

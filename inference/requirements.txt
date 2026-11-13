@@ -6,6 +6,7 @@ websockets>=15.0.1
 msgpack>=1.1.0
 numpy
 opencv-python
+h5py
 
 # Imports of the vendor camera_client and its generated protobuf stubs; the
 # proto stubs refuse to load below these versions.

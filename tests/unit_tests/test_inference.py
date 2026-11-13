@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from inference import protocol
+from inference.client.episode_recorder import EpisodeRecorder, split_joint_batch
 from inference.client.gripper_hysteresis import CLOSED_VALUE, GripperHysteresis
 from inference.client.h1_robot import camera_source_candidates, motor_position
 from inference.client.rtc_scheduler import RTCScheduler
@@ -177,6 +178,95 @@ def test_gripper_hysteresis_rejects_bad_thresholds_and_short_actions():
 
     with pytest.raises(ValueError, match="expected a 16-D action"):
         GripperHysteresis().apply(np.zeros(8, dtype=np.float32))
+
+
+def _bgr_frame(value: int) -> np.ndarray:
+    frame = np.zeros((4, 6, 3), dtype=np.uint8)
+    frame[...] = (value, value // 2, value // 3)
+    return frame
+
+
+def test_episode_recorder_writes_the_dataset_layout(tmp_path):
+    recorder = EpisodeRecorder(
+        camera_names=("cam_high", "cam_left_wrist"),
+        task_name="clear_the_bin_box",
+        task_id=3,
+        control_frequency=30.0,
+        jpeg_quality=95,
+    )
+    state = np.arange(23, dtype=np.float64)
+    frames = {"cam_high": _bgr_frame(200), "cam_left_wrist": _bgr_frame(90)}
+    for step in range(2):
+        recorder.add_step(
+            state + step, state + 100.0 + step, frames, timestamp_ms=1000.0 * step
+        )
+
+    path = recorder.save(tmp_path)
+
+    assert path is not None
+    assert path.name == "episode.hdf5"
+    assert path.parent.parent == tmp_path
+    assert (path.parent / "episode_meta.json").is_file()
+
+    import h5py
+
+    with h5py.File(path, "r") as episode:
+        assert episode.attrs["action_mode"] == "absolute"
+        assert episode.attrs["control_frequency"] == 30
+        assert episode.attrs["task_name"] == "clear_the_bin_box"
+        assert episode.attrs["task_id"] == 3
+        assert episode.attrs["total_frames"] == 2
+        assert episode.attrs["episode_id"] == path.parent.name
+
+        arm = episode["observation/state/arm/position"][:]
+        assert arm.shape == (2, 14)
+        assert arm[0].tolist() == [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+        assert episode["observation/state/effector/position"][0].tolist() == [7, 15]
+        assert episode["observation/state/waist/position"][0].tolist() == [16, 17, 18]
+        assert episode["observation/state/head/position"][0].tolist() == [19, 20]
+        assert episode["observation/state/base/velocity"][0].tolist() == [21, 22]
+        assert episode["action/arm/position"][0, 0] == 100.0
+        assert episode["observation/state/arm/position"].dtype == np.float64
+
+        stamps = episode["timestamp/t"]
+        assert stamps.attrs["rate_hz"] == pytest.approx(30.0)
+        assert stamps[:].tolist() == [0.0, 1000.0]
+        assert episode["subtask_transitions"][:].tolist() == [2]
+
+        colors = episode["observation/images/rs/cam_high/color"]
+        assert colors.dtype == object
+        assert colors.attrs["encoded_format"] == "jpeg"
+        assert colors.attrs["jpeg_quality"] == 95
+        assert colors.attrs["orig_shape"].tolist() == [4, 6, 3]
+
+        import cv2
+
+        decoded = cv2.imdecode(
+            np.frombuffer(bytes(colors[0]), dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        # The stored JPEG must decode to the BGR frame the camera produced.
+        assert decoded.shape == (4, 6, 3)
+        assert np.abs(decoded.astype(int) - _bgr_frame(200).astype(int)).max() <= 8
+
+
+def test_episode_recorder_writes_nothing_for_an_empty_episode(tmp_path):
+    recorder = EpisodeRecorder(camera_names=("cam_high",))
+
+    assert recorder.save(tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_episode_recorder_rejects_a_missing_camera(tmp_path):
+    recorder = EpisodeRecorder(camera_names=("cam_high", "cam_left_wrist"))
+
+    with pytest.raises(KeyError, match="cam_left_wrist"):
+        recorder.add_step(np.zeros(23), np.zeros(23), {"cam_high": _bgr_frame(10)})
+    assert len(recorder) == 0
+
+
+def test_split_joint_batch_rejects_a_wrong_dimension():
+    with pytest.raises(ValueError, match=r"\(T, 23\)"):
+        split_joint_batch(np.zeros((3, 22)))
 
 
 def test_rtc_payload_is_normalized_and_version_checked():
