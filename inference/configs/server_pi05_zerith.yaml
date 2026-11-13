@@ -16,7 +16,7 @@ num_steps: 10
 
 # A torch checkpoint: either an RLinf SFT run (full_weights.pt) or a converted
 # OpenPI layout (model.safetensors + config.json + <asset_id>/norm_stats.json).
-model_path: /data/4T-1/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi
+model_path: /home/jszn/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi
 
 openpi:
   task: eval
@@ -59,7 +59,7 @@ openpi:
   attn_backend: eager
 
 openpi_data:
-  norm_stats_path: /data/4T-1/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi/zerith/norm_stats.json
+  norm_stats_path: /home/jszn/hewu/alg-product/RLinf/logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi/zerith/norm_stats.json
 
 server:
   host: 0.0.0.0
