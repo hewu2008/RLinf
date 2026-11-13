@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import pdb
 import time
 from typing import Any, Sequence
 
@@ -252,6 +253,11 @@ def main(argv: list[str] | None = None) -> None:
             jpeg_quality=args.jpeg_quality,
             steps=args.warmup_steps,
         )
+
+    # The robot is in its start pose and the server is warm, so the operator resets
+    # the scene here: type ``c`` to hand control to the policy, ``q`` to abort.
+    logger.info("pausing to reset the scene before the control loop")
+    pdb.set_trace()
 
     worker = InferenceWorker(client)
     gripper = GripperHysteresis()
