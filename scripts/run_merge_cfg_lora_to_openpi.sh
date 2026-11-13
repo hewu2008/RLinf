@@ -5,7 +5,7 @@
 # The CFG-RL SFT run (is_lora: true) saves full_weights.pt with PEFT wrapper
 # names and lora_A/lora_B keys; the server loads a bare Pi0 layout and applies
 # no adapters, so the adapters have to be merged into the base weights first.
-# See inference/merge_cfg_lora_to_openpi.py for what the merge does.
+# See inference/tools/merge_cfg_lora_to_openpi.py for what the merge does.
 #
 # Usage (from the repository root):
 #   bash scripts/run_merge_cfg_lora_to_openpi.sh
@@ -28,7 +28,7 @@ ASSET_ID=${ASSET_ID:-${3:-zerith}}
 OUT=${OUT:-${4:-${DEFAULT_OUT}}}
 EXTRA_ARGS=("${@:5}")
 
-python -m inference.merge_cfg_lora_to_openpi \
+python -m inference.tools.merge_cfg_lora_to_openpi \
 	--ckpt "${CKPT}" \
 	--base-model "${BASE_MODEL}" \
 	--asset-id "${ASSET_ID}" \

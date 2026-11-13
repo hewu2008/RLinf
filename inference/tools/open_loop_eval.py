@@ -22,7 +22,7 @@ bookkeeping is involved.
 
 Run it from the repository root while ``scripts/run_inference_server.sh`` is up::
 
-    python -m inference.open_loop_eval \\
+    python -m inference.tools.open_loop_eval \\
         --data-path /data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask \\
         --traj-ids 0 1 2 3 \\
         --max-chunks 240

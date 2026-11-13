@@ -27,7 +27,7 @@ adapters into the base weights, drops the PEFT names, and reuses
 ``old_to_new_state_dict`` to write the bare Pi0 layout together with the
 ``config.json`` and ``<asset_id>/norm_stats.json`` the server needs::
 
-    python -m inference.merge_cfg_lora_to_openpi \\
+    python -m inference.tools.merge_cfg_lora_to_openpi \\
         --ckpt <run>/cfg_sft/checkpoints/global_step_30000/actor/model_state_dict/full_weights.pt \\
         --base-model /path/to/pi05-pytorch-base \\
         --asset-id zerith \\

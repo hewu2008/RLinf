@@ -62,4 +62,4 @@ if [ -n "${PROMPT}" ]; then args+=(--prompt "${PROMPT}"); fi
 if [ -n "${SAVE_PLOT_DIR}" ]; then args+=(--save-plot-dir "${SAVE_PLOT_DIR}"); fi
 
 mkdir -p logs
-python -m inference.open_loop_eval "${args[@]}" "$@" 2>&1 | tee -a "${LOG_FILE}"
+python -m inference.tools.open_loop_eval "${args[@]}" "$@" 2>&1 | tee -a "${LOG_FILE}"

@@ -456,7 +456,7 @@ def test_build_env_obs_orders_the_three_views_and_the_state():
 
 def test_open_loop_replays_only_frames_with_a_full_recorded_horizon():
     pytest.importorskip("websockets")
-    from inference.open_loop_eval import DEFAULT_CAMERAS, evaluate_episode
+    from inference.tools.open_loop_eval import DEFAULT_CAMERAS, evaluate_episode
 
     horizon = 4
 
