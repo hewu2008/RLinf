@@ -246,6 +246,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--task_id", type=int, default=0, help="task id stored in the episode metadata"
     )
+    parser.add_argument(
+        "--homing_seconds",
+        type=float,
+        default=2.0,
+        help="duration of the return-home move that ends an episode",
+    )
     return parser.parse_args(argv)
 
 
@@ -271,6 +277,7 @@ def main(argv: list[str] | None = None) -> None:
     action_horizon = int(metadata["action_horizon"])
     logger.info("server metadata: %s", metadata)
 
+    reference = None
     if args.init_hdf5:
         reference = load_reference_state(args.init_hdf5, args.init_frame_idx)
         env.move_to_target_joint(reference)
@@ -318,6 +325,32 @@ def main(argv: list[str] | None = None) -> None:
         )
     episode = {"index": 1, "steps": 0}
 
+    def record_commanded(observation: Mapping[str, Any], joints: np.ndarray) -> None:
+        """Record one step: the observation plus the joint targets sent to the motors."""
+        if recorder is None:
+            return
+        action = np.zeros(STATE_DIM)
+        action[: env.motor_count] = joints
+        recorder.add_step(
+            np.asarray(observation["qpos"]), action, observation["images"]
+        )
+
+    def return_home(target: np.ndarray) -> None:
+        """Drive the joints to ``target`` at the control rate, recording every step."""
+        start = np.asarray(env.get_joint_position(), dtype=np.float64)
+        steps = max(1, int(round(args.homing_seconds * args.control_freq)))
+        period = 1.0 / args.control_freq
+        if recorder is not None:
+            recorder.mark_homing()
+        logger.info("returning home over %d steps", steps)
+        for step in range(steps):
+            alpha = (step + 1) / steps
+            joints = (1.0 - alpha) * start + alpha * np.asarray(target, np.float64)
+            env.set_joint_action(joints)
+            if recorder is not None:
+                record_commanded(env.get_observation(), joints)
+            time.sleep(period)
+
     def start_episode() -> bool:
         """Request the first chunk of an episode."""
         scheduler.submit_bootstrap(
@@ -331,7 +364,12 @@ def main(argv: list[str] | None = None) -> None:
         return worker.wait_for_first_result(args.first_chunk_timeout)
 
     def finish_episode() -> None:
-        """Save the episode, hand the terminal to the operator, then restart."""
+        """Drive home while recording, save the episode, then hand the terminal over."""
+        return_home(
+            reference[: env.motor_count]
+            if reference is not None
+            else env.init_pose_target()
+        )
         if recorder is not None:
             try:
                 recorder.save(args.save_dir)
@@ -380,11 +418,7 @@ def main(argv: list[str] | None = None) -> None:
         else:
             commanded = postprocess_action(np.copy(action), gripper)[:-2]
             env.set_joint_action(commanded)
-            if recorder is not None:
-                # Record what reached the motors; the base slots are never commanded.
-                recorded = np.zeros(action_dim)
-                recorded[: env.motor_count] = commanded
-                recorder.add_step(state, recorded, observation["images"])
+            record_commanded(observation, commanded)
 
             result_age = worker.last_result_age()
             if result_age is not None and result_age > args.watchdog_timeout:

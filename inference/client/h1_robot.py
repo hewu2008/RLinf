@@ -260,12 +260,15 @@ class H1RobotEnv:
             )
         return {"qpos": qpos, "images": images}
 
+    def init_pose_target(self) -> np.ndarray:
+        """Joint target of :meth:`move_to_init_pose`: zeros, keeping the lift height."""
+        target = np.zeros(self.motor_count)
+        target[self._lift_index] = self.get_joint_position()[self._lift_index]
+        return target
+
     def move_to_init_pose(self) -> None:
         """Drive every joint to zero, keeping the current lift height."""
-        target = np.zeros(self.motor_count)
-        current = self.get_joint_position()
-        target[self._lift_index] = current[self._lift_index]
-        self._interpolate_to(target, label="the initial pose")
+        self._interpolate_to(self.init_pose_target(), label="the initial pose")
 
     def move_to_target_joint(self, action: np.ndarray) -> None:
         """Interpolate to a joint target given as 23-D state or 21-D joints."""

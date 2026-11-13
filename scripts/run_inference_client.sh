@@ -17,9 +17,10 @@
 # HOST and PORT say where the policy server listens; they must match how it was
 # started (scripts/run_inference_server.sh reads the same two variables).
 #
-# Press ``r`` during the run to end the current episode: the client writes
-# rollouts/<episode_id>/episode.hdf5 in the layout of the mocap dataset, then
-# drops into pdb so the scene can be reset; type ``c`` to start the next episode.
+# Press ``r`` during the run to end the current episode: the arms are driven back
+# to the start pose while that return move is recorded, then the client writes
+# rollouts/<episode_id>/episode.hdf5 in the layout of the mocap dataset and drops
+# into pdb so the scene can be reset; type ``c`` to start the next episode.
 # Pass --no-record to run without writing files.
 #
 # prompt1: Pick and place the door handle into the left bin and the L-shaped bent pipe into the right bin

@@ -98,9 +98,14 @@ class EpisodeRecorder:
         self._timestamps: list[float] = []
         self._frames: list[dict[str, bytes]] = []
         self._shapes: dict[str, tuple[int, ...]] = {}
+        self._homing_start: int | None = None
 
     def __len__(self) -> int:
         return len(self._states)
+
+    def mark_homing(self) -> None:
+        """Mark where the automatic return-home segment starts."""
+        self._homing_start = len(self._states)
 
     def add_step(
         self,
@@ -162,6 +167,8 @@ class EpisodeRecorder:
             episode.attrs["total_frames"] = count
             episode.attrs["total_subtasks"] = 1
             episode.attrs["version"] = "1.0.0"
+            if self._homing_start is not None:
+                episode.attrs["homing_start_frame"] = int(self._homing_start)
 
             for group, vectors in (("observation/state", states), ("action", actions)):
                 for field, series in split_joint_batch(vectors).items():

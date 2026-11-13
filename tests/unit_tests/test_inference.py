@@ -217,6 +217,7 @@ def test_episode_recorder_writes_the_dataset_layout(tmp_path):
         assert episode.attrs["task_id"] == 3
         assert episode.attrs["total_frames"] == 2
         assert episode.attrs["episode_id"] == path.parent.name
+        assert "homing_start_frame" not in episode.attrs
 
         arm = episode["observation/state/arm/position"][:]
         assert arm.shape == (2, 14)
@@ -247,6 +248,22 @@ def test_episode_recorder_writes_the_dataset_layout(tmp_path):
         # The stored JPEG must decode to the BGR frame the camera produced.
         assert decoded.shape == (4, 6, 3)
         assert np.abs(decoded.astype(int) - _bgr_frame(200).astype(int)).max() <= 8
+
+
+def test_episode_recorder_marks_the_homing_segment(tmp_path):
+    recorder = EpisodeRecorder(camera_names=("cam_high",))
+    frames = {"cam_high": _bgr_frame(10)}
+    recorder.add_step(np.zeros(23), np.zeros(23), frames, timestamp_ms=0.0)
+    recorder.mark_homing()
+    recorder.add_step(np.zeros(23), np.zeros(23), frames, timestamp_ms=33.0)
+
+    path = recorder.save(tmp_path)
+
+    import h5py
+
+    with h5py.File(path, "r") as episode:
+        assert episode.attrs["homing_start_frame"] == 1
+        assert episode.attrs["total_frames"] == 2
 
 
 def test_episode_recorder_writes_nothing_for_an_empty_episode(tmp_path):
