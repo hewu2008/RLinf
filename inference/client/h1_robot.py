@@ -181,12 +181,11 @@ class H1RobotEnv:
     def __init__(
         self,
         *,
-        camera_names: Sequence[str] = DEFAULT_CAMERA_NAMES,
+        camera_names: Sequence[str] | None = DEFAULT_CAMERA_NAMES,
         sdk_dir: str | None = None,
         grpc_target: str = DEFAULT_GRPC_TARGET,
     ) -> None:
         _ensure_sdk_on_path(sdk_dir)
-        from camera_client import CameraClient
         from lib_h1_sdk_python import (
             EtherCAT_Motor_Index,
             H1Robot,
@@ -220,10 +219,14 @@ class H1RobotEnv:
             )
         self._lift_index = self._motors.index(index.MOTOR_LIFT)
 
-        self.camera_names = tuple(camera_names)
+        self.camera_names = tuple(camera_names or ())
         self._robot = H1Robot()
         self._connect(MotorControlMode)
-        self._cameras = CameraRecorder(CameraClient, grpc_target, self.camera_names)
+        self._cameras = None
+        if self.camera_names:
+            from camera_client import CameraClient
+
+            self._cameras = CameraRecorder(CameraClient, grpc_target, self.camera_names)
 
     @property
     def motor_count(self) -> int:
@@ -251,6 +254,11 @@ class H1RobotEnv:
         """Return ``{"qpos": float64[23], "images": {camera: BGR frame}}``."""
         qpos = np.zeros(STATE_DIM)
         qpos[: self.motor_count] = self.get_joint_position()
+        if self._cameras is None:
+            raise RuntimeError(
+                "this environment was created without cameras; pass camera_names "
+                "to read observations"
+            )
         images = self._cameras.latest()
         missing = [name for name in self.camera_names if name not in images]
         if missing:

@@ -64,6 +64,32 @@ def split_joint_batch(vectors: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def merge_joint_batch(fields: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Rebuild ``(T, 23)`` states or actions from the dataset's per-part arrays."""
+    parts = {name: np.asarray(fields[name], dtype=np.float64) for name in FIELD_PATHS}
+    count = parts["arm"].shape[0]
+    for name, width in (
+        ("arm", 14),
+        ("gripper", 2),
+        ("waist", 3),
+        ("head", 2),
+        ("base", 2),
+    ):
+        if parts[name].shape != (count, width):
+            raise ValueError(
+                f"expected {name} of shape ({count}, {width}), got {parts[name].shape}"
+            )
+    vectors = np.zeros((count, STATE_DIM))
+    arm = parts["arm"]
+    vectors[:, ARM_JOINT_SLICES[0]] = arm[:, :7]
+    vectors[:, ARM_JOINT_SLICES[1]] = arm[:, 7:]
+    vectors[:, list(GRIPPER_INDICES)] = parts["gripper"]
+    vectors[:, WAIST_SLICE] = parts["waist"]
+    vectors[:, HEAD_SLICE] = parts["head"]
+    vectors[:, BASE_SLICE] = parts["base"]
+    return vectors
+
+
 class EpisodeRecorder:
     """Buffer one episode in memory and write it when the operator ends it.
 

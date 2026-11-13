@@ -20,7 +20,11 @@ import numpy as np
 import pytest
 
 from inference import protocol
-from inference.client.episode_recorder import EpisodeRecorder, split_joint_batch
+from inference.client.episode_recorder import (
+    EpisodeRecorder,
+    merge_joint_batch,
+    split_joint_batch,
+)
 from inference.client.gripper_hysteresis import CLOSED_VALUE, GripperHysteresis
 from inference.client.h1_robot import camera_source_candidates, motor_position
 from inference.client.rtc_scheduler import RTCScheduler
@@ -284,6 +288,83 @@ def test_episode_recorder_rejects_a_missing_camera(tmp_path):
 def test_split_joint_batch_rejects_a_wrong_dimension():
     with pytest.raises(ValueError, match=r"\(T, 23\)"):
         split_joint_batch(np.zeros((3, 22)))
+
+
+def test_split_and_merge_joint_batch_round_trip():
+    vectors = np.random.default_rng(0).normal(size=(4, 23))
+
+    assert np.allclose(merge_joint_batch(split_joint_batch(vectors)), vectors)
+
+
+class _FakeRobotEnv:
+    """Stand-in for :class:`inference.client.h1_robot.H1RobotEnv` without motors."""
+
+    motor_count = 21
+
+    def __init__(self) -> None:
+        self.commands: list[np.ndarray] = []
+
+    def set_joint_action(self, action) -> None:
+        self.commands.append(np.asarray(action).copy())
+
+
+def test_replay_sends_every_recorded_action():
+    from inference.client.replay import replay_actions
+
+    actions = np.arange(3 * 23, dtype=np.float64).reshape(3, 23)
+    timestamps = np.array([0.0, 33.0, 66.0])
+    env = _FakeRobotEnv()
+
+    replay_actions(env, actions, timestamps, speed=1000.0)
+
+    assert len(env.commands) == 3
+    assert env.commands[0].shape == (21,)
+    assert np.allclose(env.commands[2], actions[2, :21])
+
+
+def test_replay_selects_frames_around_the_homing_segment():
+    from inference.client.replay import RecordedEpisode, select_frames
+
+    episode = RecordedEpisode(
+        actions=np.zeros((5, 23)),
+        timestamps=np.arange(5, dtype=np.float64),
+        control_frequency=30.0,
+        homing_start_frame=3,
+        task_name="t",
+    )
+
+    actions, timestamps = select_frames(episode, skip_homing=True)
+    assert len(actions) == 3
+    assert timestamps.tolist() == [0.0, 1.0, 2.0]
+
+    with pytest.raises(ValueError, match="empty"):
+        select_frames(episode, start=4, end=4)
+
+
+def test_replay_loads_an_episode_written_by_the_recorder(tmp_path):
+    from inference.client.replay import load_episode, resolve_episode_path
+
+    recorder = EpisodeRecorder(
+        camera_names=("cam_high",), task_name="t", control_frequency=30.0
+    )
+    frames = {"cam_high": _bgr_frame(10)}
+    state = np.arange(23, dtype=np.float64)
+    for step in range(2):
+        recorder.add_step(state, state + 1.0, frames, timestamp_ms=100.0 * step)
+    path = recorder.save(tmp_path)
+
+    episode = load_episode(path)
+
+    assert episode.actions.shape == (2, 23)
+    assert np.allclose(episode.actions, state + 1.0)
+    assert episode.timestamps.tolist() == [0.0, 100.0]
+    assert episode.control_frequency == pytest.approx(30.0)
+    assert episode.task_name == "t"
+    assert episode.homing_start_frame is None
+    assert resolve_episode_path(str(path.parent)) == path
+
+    with pytest.raises(FileNotFoundError, match="no episode file"):
+        resolve_episode_path(str(tmp_path / "missing"))
 
 
 def test_rtc_payload_is_normalized_and_version_checked():
