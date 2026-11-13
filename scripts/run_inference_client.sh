@@ -14,6 +14,14 @@
 # camera_client; without either, client/lib is used.
 # Client deps: pip install -r inference/requirements.txt
 #
+# The motors are driven through sudo by default. sudo resets PATH, so the
+# interpreter is resolved to an absolute path first and that path is executed,
+# keeping the conda environment's site-packages:
+#   ROBOT_PYTHON=/path/to/python bash scripts/run_inference_client.sh
+# ROBOT_PYTHON may also be a plain name on PATH, resolved here; set SUDO=0 to run
+# the interpreter directly. sudo drops the exported variables, so list the ones
+# the vendor SDK needs in SUDO_ENV, e.g. SUDO_ENV="LD_LIBRARY_PATH=$LD_LIBRARY_PATH".
+#
 # HOST and PORT say where the policy server listens; they must match how it was
 # started (scripts/run_inference_server.sh reads the same two variables).
 #
@@ -33,7 +41,29 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-"${ROBOT_PYTHON:-python}" -m inference.client.main \
+PYTHON=${ROBOT_PYTHON:-python}
+
+launcher=""
+if [ "${SUDO:-1}" = "1" ]; then
+  case "${PYTHON}" in
+    /*) ;;
+    *)
+      resolved=$(command -v "${PYTHON}" || true)
+      if [ -z "${resolved}" ]; then
+        echo "cannot resolve '${PYTHON}' on PATH; set ROBOT_PYTHON to an absolute path" >&2
+        exit 1
+      fi
+      PYTHON=${resolved}
+      ;;
+  esac
+  launcher="sudo"
+  if [ -n "${SUDO_ENV:-}" ]; then
+    launcher="sudo env ${SUDO_ENV}"
+  fi
+fi
+
+# shellcheck disable=SC2086  # launcher is a command prefix, empty when unused.
+${launcher} "${PYTHON}" -m inference.client.main \
   --host "${HOST:-172.31.200.200}" \
   --port "${PORT:-55555}" \
   --sdk_dir "${H1_SDK_DIR:-inference/client/lib}" \
