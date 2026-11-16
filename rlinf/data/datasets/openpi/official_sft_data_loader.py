@@ -112,10 +112,16 @@ def _with_subtask_labels(model_cfg: Any, config: Any, repo_id: str) -> Any:
             "found under %s; every frame will train on the plain pi0.5 prompt.",
             repo_id,
         )
+    max_subtask_len = int(
+        OmegaConf.select(model_cfg, "openpi.max_subtask_len", default=20)
+    )
     return dataclasses.replace(
         config,
         data=dataclasses.replace(
-            config.data, subtask_prediction=True, subtasks=subtasks
+            config.data,
+            subtask_prediction=True,
+            subtasks=subtasks,
+            max_subtask_len=max_subtask_len,
         ),
     )
 

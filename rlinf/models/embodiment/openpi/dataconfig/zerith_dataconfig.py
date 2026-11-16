@@ -86,7 +86,7 @@ class LeRobotZerithDataConfig(DataConfigFactory):
     # for every frame (plain pi0.5 behaviour).
     subtasks: Mapping[int, str] | None = None
     # Cap on the supervised/generated subtask length.
-    max_subtask_len: int = 20
+    max_subtask_len: int = 24
 
     @override
     def create(

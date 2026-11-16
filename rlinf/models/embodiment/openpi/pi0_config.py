@@ -46,7 +46,7 @@ class Pi0Config:
     # Weight of the subtask cross-entropy added to the flow-matching loss.
     subtask_loss_weight: float = 0.1
     # Slots reserved for the generated subtask; also caps the supervised length.
-    max_subtask_len: int = 20
+    max_subtask_len: int = 24
     # 0.0 selects the argmax token (greedy), > 0.0 samples with logits / T.
     subtask_temperature: float = 0.0
     # Replay each decode step from a captured CUDA graph (falls back to eager

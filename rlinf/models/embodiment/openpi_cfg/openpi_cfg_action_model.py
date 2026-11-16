@@ -178,7 +178,7 @@ class OpenPi0Config(Pi0Config):
     # The classification head is intentionally not implemented.
     train_subtask_prediction: bool = False
     subtask_loss_weight: float = 0.1
-    max_subtask_len: int = 20
+    max_subtask_len: int = 24
 
     def __post_init__(self):
         if self.guidance_type not in _VALID_GUIDANCE_TYPES:
@@ -513,7 +513,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         logits = self.paligemma_with_expert.paligemma.lm_head(
             hidden[sample_idx, token_idx]
         )
-        target = targets[sample_idx, token_idx]
+        target = targets[sample_idx, token_idx].long()
         ce = F.cross_entropy(logits.float(), target, reduction="none")
         accuracy = (logits.argmax(dim=-1) == target).float().mean().item()
         return ce.mean(), accuracy

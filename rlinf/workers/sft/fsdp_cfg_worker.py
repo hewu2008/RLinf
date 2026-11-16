@@ -173,6 +173,9 @@ class FSDPCfgWorker(FSDPSftWorker):
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.actor.micro_batch_size * self._world_size,
             repo_id=first_path,
+            data_kwargs=OmegaConf.select(
+                self.cfg.actor.model, "openpi_data", default=None
+            ),
         )
         if train_subtask:
             config = self._with_subtask_labels(config, first_path)
@@ -285,10 +288,18 @@ class FSDPCfgWorker(FSDPSftWorker):
                 f"was found under {dataset_path}; frames train on the plain pi0.5 "
                 "prompt and the subtask loss stays zero."
             )
+        max_subtask_len = int(
+            OmegaConf.select(
+                self.cfg.actor.model.openpi, "max_subtask_len", default=20
+            )
+        )
         return dataclasses.replace(
             config,
             data=dataclasses.replace(
-                config.data, subtask_prediction=True, subtasks=subtasks
+                config.data,
+                subtask_prediction=True,
+                subtasks=subtasks,
+                max_subtask_len=max_subtask_len,
             ),
         )
 

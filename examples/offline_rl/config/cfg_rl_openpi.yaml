@@ -60,6 +60,8 @@ actor:
     add_value_head: False
     is_lora: true
     lora_rank: 32
+    openpi_data:
+      norm_stats_path: "/data/4T-1/hewu/model_zoo/pi05-pytorch-base/zerith/norm_stats.json"
     openpi:
       config_name: "pi05_zerith"
       cfgrl_guidance_scale: 1.0

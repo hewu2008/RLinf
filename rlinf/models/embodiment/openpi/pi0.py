@@ -596,7 +596,7 @@ class Pi0(model.BaseModel):
         # Shift by one so every hidden state predicts its next token: the last
         # prompt token before the first subtask token is included.
         hidden = prefix_out[:, -text_len:-1]
-        targets = observation.tokenized_prompt[:, 1:]
+        targets = observation.tokenized_prompt[:, 1:].long()
         mask = observation.token_loss_mask[:, 1:].to(torch.bool)
         selected = torch.nonzero(mask, as_tuple=False)
         if selected.numel() == 0:
