@@ -668,6 +668,67 @@ Visualize specific episodes:
 - ``episode_{N}_summary.png``: Key frames + value/advantage time series for each episode (frames above threshold highlighted with green border)
 - ``episode_{N}.mp4``: Per-frame replay video with advantage annotations
 
+Subtask Prediction Training (Optional)
+--------------------------------------
+
+Long-horizon tasks such as sorting several parts depend on language to decide which arm to use,
+which object to pick, and which bin to drop it in. The pi0.5 subtask stage lets the VLM predict the
+current subtask as text and conditions the action expert on it, turning that decision from a visual
+inference into an explicit input. This implementation trains a token-level subtask cross-entropy
+only; there is **no classification head**.
+
+**Data requirements**
+
+- ``meta/subtasks.jsonl`` under the dataset root, one ``{"subtask_index", "subtask"}`` record per line;
+- a per-frame ``subtask_index`` column in the parquet files; ``-1`` marks an unannotated frame whose
+  subtask loss is zero.
+
+**Training mechanics**
+
+- the prompt layout is ``Task: <task>, State: <state>;\nSubtask: <subtask>;\nAction: ``;
+- only the subtask tokens (including their EOS) carry the cross-entropy; the rest is prefix;
+- subtask tokens attend causally while the prefix stays bidirectional;
+- the subtask label is an input condition and is orthogonal to the advantage routing used by CFG.
+
+**Configuration**
+
+.. code:: yaml
+
+   actor:
+     model:
+       openpi:
+         train_subtask_prediction: true
+         subtask_loss_weight: 1.0     # weight of the subtask CE against the action loss
+         max_subtask_len: 20          # cap on the supervised and generated subtask length
+
+Training logs then add ``subtask_loss``; CFG training also reports ``subtask_token_accuracy``.
+A dataset without ``subtasks.jsonl`` falls back to the plain pi0.5 prompt on every frame, so the
+subtask loss stays zero.
+
+.. note::
+
+   Enabling the subtask stage changes the prompt layout (a ``Subtask: ...`` segment is inserted),
+   which shifts every position id. An existing SFT checkpoint cannot resume seamlessly; restart
+   from the base weights.
+
+**Inference**
+
+Serving uses two stages: generate the subtask from the ``Task/State/\nSubtask: `` prefix, then
+re-encode the generated text in the training layout and hand it to the existing denoiser (RTC and
+CFG guidance are unchanged). Server configuration:
+
+.. code:: yaml
+
+   openpi:
+     sample_subtask_prediction: true
+     subtask_temperature: 0.0       # 0.0 is greedy decoding
+     max_subtask_len: 20
+     subtask_refresh_steps: 50      # regenerate the subtask every N requests
+
+Subtask generation is a dynamic-length loop that cannot enter a CUDA graph, so the result is cached
+for ``subtask_refresh_steps`` requests: one generation per subtask segment (about every 24 seconds)
+instead of one per action chunk. New connections and the end of warmup clear the cache.
+
 Run It
 ------
 

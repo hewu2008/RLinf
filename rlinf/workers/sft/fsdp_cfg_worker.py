@@ -20,13 +20,14 @@ CfgMixtureDataset for weighted sampling across datasets.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils._pytree import tree_map
 
 from rlinf.data.datasets.recap.cfg_model import (
@@ -39,6 +40,10 @@ from rlinf.data.datasets.recap.utils import (
     cast_image_features,
 )
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+from rlinf.models.embodiment.openpi.transforms.subtask import (
+    SubtaskPaligemmaTokenizer,
+    TokenizePi05SubtaskGuidanceInputs,
+)
 from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict
@@ -156,15 +161,24 @@ class FSDPCfgWorker(FSDPSftWorker):
             )
 
         first_path = datasets_config[0]["dataset_path"]
+        train_subtask = bool(
+            OmegaConf.select(
+                self.cfg.actor.model.openpi,
+                "train_subtask_prediction",
+                default=False,
+            )
+        )
         config = get_openpi_config(
             openpi_cfg.config_name,
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.actor.micro_batch_size * self._world_size,
             repo_id=first_path,
         )
+        if train_subtask:
+            config = self._with_subtask_labels(config, first_path)
         data_config = config.data.create(config.assets_dirs, config.model)
 
-        model_transforms = self._build_model_transforms(data_config)
+        model_transforms = self._build_model_transforms(data_config, train_subtask)
         norm_stats = data_config.norm_stats or {}
 
         datasets_with_weights = []
@@ -254,8 +268,39 @@ class FSDPCfgWorker(FSDPSftWorker):
         data_loader = CFGDataLoaderImpl(data_config, torch_data_loader)
         return data_loader, data_loader.data_config()
 
-    def _build_model_transforms(self, data_config: Any) -> list:
-        """Replace TokenizePrompt with TokenizePromptWithGuidance in model transforms."""
+    def _with_subtask_labels(self, config: Any, dataset_path: str) -> Any:
+        """Attach the per-frame subtask mapping to the OpenPI data config."""
+        from rlinf.data.storage.lerobot import resolve_lerobot_dataset_root
+        from rlinf.models.embodiment.openpi.transforms.subtask import load_subtasks
+
+        if not hasattr(config.data, "subtask_prediction"):
+            raise ValueError(
+                "actor.model.openpi.train_subtask_prediction is set but "
+                f"{type(config.data).__name__} has no 'subtask_prediction' field."
+            )
+        subtasks = load_subtasks(resolve_lerobot_dataset_root(dataset_path))
+        if not subtasks:
+            self.log_warning(
+                "train_subtask_prediction is enabled but no meta/subtasks.jsonl "
+                f"was found under {dataset_path}; frames train on the plain pi0.5 "
+                "prompt and the subtask loss stays zero."
+            )
+        return dataclasses.replace(
+            config,
+            data=dataclasses.replace(
+                config.data, subtask_prediction=True, subtasks=subtasks
+            ),
+        )
+
+    def _build_model_transforms(
+        self, data_config: Any, train_subtask: bool = False
+    ) -> list:
+        """Replace the prompt tokenizer with its guidance variant.
+
+        When subtask prediction is on, the data config already uses
+        ``TokenizePi05SubtaskInputs``; its guidance counterpart keeps the same
+        subtask layout on all three prompts so the CFG branches can be stacked.
+        """
         tokenizer = None
         for t in data_config.model_transforms.inputs:
             if hasattr(t, "tokenizer"):
@@ -267,7 +312,27 @@ class FSDPCfgWorker(FSDPSftWorker):
 
         model_transforms = []
         for t in data_config.model_transforms.inputs:
-            if type(t).__name__ == "TokenizePrompt":
+            name = type(t).__name__
+            if name == "TokenizePi05SubtaskInputs":
+                if not isinstance(tokenizer, SubtaskPaligemmaTokenizer):
+                    raise ValueError(
+                        "Subtask tokenization requires SubtaskPaligemmaTokenizer; "
+                        f"got {type(tokenizer).__name__}."
+                    )
+                model_transforms.append(
+                    TokenizePi05SubtaskGuidanceInputs(
+                        tokenizer=tokenizer,
+                        discrete_state_input=getattr(t, "discrete_state_input", False),
+                        max_subtask_len=getattr(t, "max_subtask_len", 20),
+                    )
+                )
+            elif name == "TokenizePrompt":
+                if train_subtask:
+                    raise ValueError(
+                        "actor.model.train_subtask_prediction is enabled but the "
+                        "data config still emits TokenizePrompt; the Zerith data "
+                        "config did not apply the subtask transform."
+                    )
                 model_transforms.append(
                     TokenizePromptWithGuidance(
                         tokenizer=tokenizer,

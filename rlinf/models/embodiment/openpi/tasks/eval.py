@@ -21,15 +21,21 @@ from typing import Any, Literal, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from rlinf.models.embodiment.openpi.env_io import EnvIO
 from rlinf.models.embodiment.openpi.modules.model import (
     Observation,
     preprocess_observation,
 )
-from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop
+from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop, make_attn_mask
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
+from rlinf.models.embodiment.openpi.transforms.subtask import (
+    PALIGEMMA_EOS_TOKEN,
+    SubtaskPaligemmaTokenizer,
+    TokenizePi05SubtaskInputs,
+)
 from rlinf.utils.logging import get_logger
 
 CFG_GUIDANCE_TYPES = ("positive", "negative")
@@ -105,6 +111,12 @@ class Pi0Eval(EnvIO, Pi0):
         self._rtc_denoise_fn = None
         self._rtc_action_anchor = None
         self._rtc_anchor_mismatch_logged = False
+        # Subtask generation state: the tokenizer is installed with the input
+        # pipeline, and the cache skips regeneration for every request.
+        self._subtask_tokenizer: SubtaskPaligemmaTokenizer | None = None
+        self._subtask_cache: str | None = None
+        self._subtask_cache_prompt: str | None = None
+        self._subtask_requests = 0
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
             "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
@@ -137,7 +149,24 @@ class Pi0Eval(EnvIO, Pi0):
                 "use a training task wrapper (rl / dagger / dsrl) for train rollouts."
             )
         observation = self.env_obs_to_observation(env_obs)
+        subtask = None
+        prompt = None
+        if self.sample_subtask_prediction:
+            prompt = self._prompt_from_env_obs(env_obs)
+            subtask = self._cached_subtask(prompt)
+            if subtask is None:
+                subtask = self.generate_subtask(observation, prompt)
+                self._subtask_cache = subtask
+                self._subtask_cache_prompt = prompt
+                self._subtask_requests = 0
+            observation = self._with_subtask_tokens(observation, prompt, subtask)
         cond_observation = self._guidance_observation(env_obs)
+        if cond_observation is not None and subtask and prompt is not None:
+            cond_observation = self._with_subtask_tokens(
+                cond_observation,
+                f"{prompt}\nAdvantage: {self.guidance_type}",
+                subtask,
+            )
         logger = get_logger()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -153,20 +182,24 @@ class Pi0Eval(EnvIO, Pi0):
                 f"delay={rtc_context.delay_steps}",
             )
         if rtc_context is not None and self.rtc_enabled:
-            return self._predict_eval_with_rtc(
+            actions, result = self._predict_eval_with_rtc(
                 observation,
                 rtc_context=rtc_context,
                 cond_observation=cond_observation,
                 noise=noise,
                 rng=rng,
             )
-        return self._predict_eval(
-            observation,
-            noise=noise,
-            rng=rng,
-            cond_observation=cond_observation,
-            cfg_scale=self.cfgrl_guidance_scale,
-        )
+        else:
+            actions, result = self._predict_eval(
+                observation,
+                noise=noise,
+                rng=rng,
+                cond_observation=cond_observation,
+                cfg_scale=self.cfgrl_guidance_scale,
+            )
+        if subtask is not None:
+            result["subtask"] = subtask
+        return actions, result
 
     def enable_sampler_graph(self) -> None:
         """Serve both denoise loops from captured CUDA graphs.
@@ -239,6 +272,135 @@ class Pi0Eval(EnvIO, Pi0):
         )
         return self.env_obs_to_observation(cond_env_obs)
 
+    @staticmethod
+    def _prompt_from_env_obs(env_obs: dict[str, Any]) -> str:
+        """Return the single task description a serving request carries."""
+        prompt = env_obs.get("task_descriptions", env_obs.get("prompt"))
+        if isinstance(prompt, (list, tuple)):
+            prompt = prompt[0]
+        if isinstance(prompt, bytes):
+            prompt = prompt.decode("utf-8")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(
+                "subtask prediction needs a task description in env_obs; "
+                f"got {sorted(env_obs)}"
+            )
+        return prompt
+
+    @torch.no_grad()
+    def generate_subtask(self, observation: Observation, prompt: str) -> str:
+        """Generate the subtask text from the prefix with greedy decoding.
+
+        The prefix ends at ``Subtask: `` so the decoded tokens are exactly the
+        subtask answer; the action branch is tokenized separately afterwards.
+        """
+        if self._subtask_tokenizer is None:
+            raise RuntimeError(
+                "generate_subtask needs the subtask tokenizer; call "
+                "setup_transforms with a TokenizePi05SubtaskInputs stage."
+            )
+        if observation.state.shape[0] != 1:
+            raise ValueError(
+                "subtask generation supports one request per call; got batch "
+                f"{observation.state.shape[0]}."
+            )
+
+        state = observation.state[0].detach().to(torch.float32).cpu().numpy()
+        prefix_tokens = self._subtask_tokenizer.encode_subtask_prefix(prompt, state)
+        device = observation.state.device
+        tokens = torch.tensor([prefix_tokens], dtype=torch.long, device=device)
+        token_mask = torch.ones_like(tokens, dtype=torch.bool)
+        positions = torch.arange(tokens.shape[1], device=device)[None, :]
+        prefix_attn_mask = make_attn_mask(token_mask, torch.zeros_like(token_mask))
+        outputs, kv_cache = self.llm(
+            [self.llm.embed(tokens), None],
+            positions=positions,
+            mask=prefix_attn_mask,
+        )
+        hidden = outputs[0][:, -1]
+
+        next_pos = tokens.shape[1]
+        generated = []
+        for _ in range(self.max_subtask_len):
+            logits = self.llm.embedder.decode(hidden)
+            if self.subtask_temperature > 0.0:
+                probs = F.softmax(logits.float() / self.subtask_temperature, dim=-1)
+                token = torch.multinomial(probs, num_samples=1)
+            else:
+                token = logits.argmax(dim=-1, keepdim=True)
+            generated.append(token)
+            if int(token[0, 0]) == PALIGEMMA_EOS_TOKEN:
+                break
+            step_mask = torch.ones(
+                (1, 1, next_pos + 1), dtype=torch.bool, device=device
+            )
+            step_positions = torch.full(
+                (1, 1), next_pos, dtype=torch.long, device=device
+            )
+            step_outputs, kv_cache = self.llm(
+                [self.llm.embed(token), None],
+                positions=step_positions,
+                mask=step_mask,
+                kv_cache=kv_cache,
+                return_prefix=False,
+            )
+            hidden = step_outputs[0][:, -1]
+            next_pos += 1
+
+        subtask = self._subtask_tokenizer.detokenize(
+            torch.cat(generated, dim=1)[0].cpu().numpy()
+        )
+        if not subtask:
+            get_logger().warning(
+                "Pi0Eval: subtask generation produced an empty string; the action "
+                "branch falls back to the plain prompt"
+            )
+        return subtask
+
+    def _with_subtask_tokens(
+        self, observation: Observation, prompt: str, subtask: str
+    ) -> Observation:
+        """Replace the plain prompt with the subtask-conditioned training layout."""
+        if self._subtask_tokenizer is None:
+            raise RuntimeError("subtask tokenizer is not installed")
+        if not subtask:
+            return observation
+        state = observation.state[0].detach().to(torch.float32).cpu().numpy()
+        tokens, token_mask, ar_mask, _ = (
+            self._subtask_tokenizer.tokenize_subtask_training(
+                prompt, subtask, state, max_subtask_len=self.max_subtask_len
+            )
+        )
+        device = observation.state.device
+        return dataclasses.replace(
+            observation,
+            tokenized_prompt=torch.as_tensor(tokens, dtype=torch.long, device=device)[
+                None
+            ],
+            tokenized_prompt_mask=torch.as_tensor(
+                token_mask, dtype=torch.bool, device=device
+            )[None],
+            token_ar_mask=torch.as_tensor(ar_mask, dtype=torch.bool, device=device)[
+                None
+            ],
+            token_loss_mask=None,
+        )
+
+    def reset_subtask_cache(self) -> None:
+        """Drop the cached subtask; call when a new episode starts."""
+        self._subtask_cache = None
+        self._subtask_cache_prompt = None
+        self._subtask_requests = 0
+
+    def _cached_subtask(self, prompt: str) -> str | None:
+        """Return the cached subtask while the episode is unchanged."""
+        if self._subtask_cache is None or prompt != self._subtask_cache_prompt:
+            return None
+        if self._subtask_requests >= self.subtask_refresh_steps:
+            return None
+        self._subtask_requests += 1
+        return self._subtask_cache
+
     def setup_transforms(
         self,
         transforms: Sequence,
@@ -246,6 +408,17 @@ class Pi0Eval(EnvIO, Pi0):
     ) -> None:
         """Install the pipelines and cache what the RTC re-anchor needs."""
         super().setup_transforms(transforms, output_transforms)
+        self._subtask_tokenizer = None
+        for transform in self._input_transform_fn.transforms:
+            if isinstance(transform, TokenizePi05SubtaskInputs):
+                self._subtask_tokenizer = transform.tokenizer
+                break
+        if self.sample_subtask_prediction and self._subtask_tokenizer is None:
+            raise ValueError(
+                "sample_subtask_prediction is enabled but the input pipeline has "
+                "no TokenizePi05SubtaskInputs; build the model from a Zerith pi0.5 "
+                "config with the subtask tokenizer enabled."
+            )
         from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
             action_anchor_from_transforms,
         )

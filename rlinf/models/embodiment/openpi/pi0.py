@@ -47,9 +47,11 @@ def make_attn_mask(input_mask: torch.Tensor, mask_ar: torch.Tensor) -> torch.Ten
 
     Args:
         input_mask: bool[B, N] - true if token is valid
-        mask_ar: bool[N] - true where next token starts a new autoregressive block
+        mask_ar: bool[B, N] or bool[N] - true where next token starts a new
+            autoregressive block; a 1D mask is shared across the batch
     """
-    mask_ar = mask_ar.expand(input_mask.shape[0], -1)
+    if mask_ar.dim() == 1:
+        mask_ar = mask_ar.expand(input_mask.shape[0], -1)
     cumsum = torch.cumsum(mask_ar.int(), dim=1)
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
@@ -174,6 +176,12 @@ class Pi0(model.BaseModel):
         self.pcd = config.pcd
         self.embed_dtype = _str_to_dtype(config.dtype)
         self._config = config
+        self.train_subtask_prediction = bool(config.train_subtask_prediction)
+        self.sample_subtask_prediction = bool(config.sample_subtask_prediction)
+        self.subtask_loss_weight = float(config.subtask_loss_weight)
+        self.max_subtask_len = int(config.max_subtask_len)
+        self.subtask_temperature = float(config.subtask_temperature)
+        self.subtask_refresh_steps = int(config.subtask_refresh_steps)
         # ``None`` keeps :func:`euler_denoise_loop`; Pi0Eval.enable_sampler_graph
         # swaps in a captured CUDA graph for eval serving.
         self._plain_denoise_fn = None
@@ -270,7 +278,8 @@ class Pi0(model.BaseModel):
         Returns:
             tokens: (B, S, emb_dim) embedded tokens
             input_mask: (B, S) mask of valid tokens
-            ar_mask: (S,) autoregressive mask (all False for prefix)
+            ar_mask: (B, S) autoregressive mask (all False for prefix unless a
+                token_ar_mask is supplied for subtask prediction)
         """
         tokens = []
         input_mask = []
@@ -291,14 +300,37 @@ class Pi0(model.BaseModel):
                     obs.image_masks[name], "b -> b s", s=image_tokens.shape[1]
                 )
             )
-            ar_mask += [False] * image_tokens.shape[1]
+            ar_mask.append(
+                torch.zeros(
+                    image_tokens.shape[:2],
+                    dtype=torch.bool,
+                    device=image_tokens.device,
+                )
+            )
 
         # Add language tokens
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.llm.embed(obs.tokenized_prompt)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            if obs.token_ar_mask is not None:
+                # Subtask tokens attend causally; everything before them stays
+                # bidirectional. The mask is per sample because prompt lengths
+                # differ inside a batch.
+                token_ar_mask = obs.token_ar_mask.to(torch.bool)
+                if token_ar_mask.dim() == 1:
+                    token_ar_mask = token_ar_mask.unsqueeze(0).expand(
+                        tokenized_inputs.shape[0], -1
+                    )
+                ar_mask.append(token_ar_mask)
+            else:
+                ar_mask.append(
+                    torch.zeros(
+                        tokenized_inputs.shape[:2],
+                        dtype=torch.bool,
+                        device=tokenized_inputs.device,
+                    )
+                )
 
         # Add point cloud tokens
         if self.pcd and obs.pcd_xyz is not None:
@@ -317,14 +349,17 @@ class Pi0(model.BaseModel):
                     pcd_tokens.shape[:2], dtype=torch.bool, device=pcd_tokens.device
                 )
             )
-            ar_mask += [False] * pcd_tokens.shape[1]
+            ar_mask.append(
+                torch.zeros(
+                    pcd_tokens.shape[:2], dtype=torch.bool, device=pcd_tokens.device
+                )
+            )
 
         tokens = torch.cat(tokens, dim=1)
         input_mask = torch.cat(input_mask, dim=1)
-        # Every prefix token attends bidirectionally, so the autoregressive mask
-        # is all False. Building it on the device keeps the forward pass free of
-        # host-to-device copies, which a CUDA graph capture rejects.
-        ar_mask = torch.zeros(len(ar_mask), dtype=torch.bool, device=tokens.device)
+        # Built on the device so the forward pass has no host-to-device copies,
+        # which a CUDA graph capture rejects.
+        ar_mask = torch.cat(ar_mask, dim=1)
         return tokens, input_mask, ar_mask
 
     def embed_suffix(
@@ -343,7 +378,7 @@ class Pi0(model.BaseModel):
         Returns:
             tokens: (B, S, emb_dim)
             input_mask: (B, S)
-            ar_mask: (S,)
+            ar_mask: (B, S)
             adarms_cond: (B, emb_dim) or None
         """
         input_mask = []
@@ -406,11 +441,13 @@ class Pi0(model.BaseModel):
         # assignment: an indexed write to a bool tensor is not permitted while a
         # CUDA graph captures the stream, and the mask is static anyway.
         ar_count = 1 if self.pi05 else 2
-        ar_mask = torch.arange(input_mask.shape[1], device=tokens.device) < ar_count
+        ar_mask = (
+            torch.arange(input_mask.shape[1], device=tokens.device) < ar_count
+        ).expand(B, -1)
 
         return tokens, input_mask, ar_mask, adarms_cond
 
-    def compute_loss(
+    def _flow_forward(
         self,
         observation: model.Observation,
         actions: torch.Tensor,
@@ -419,11 +456,14 @@ class Pi0(model.BaseModel):
         rng: torch.Generator | None = None,
         noise: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Compute flow matching loss.
+        return_prefix: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, model.Observation]:
+        """Run one flow-matching pass.
 
         Returns:
-            loss: (B, action_horizon, action_dim) per-element MSE
+            v_t, u_t: (B, action_horizon, action_dim) velocity predictions and targets.
+            prefix_out: paligemma hidden states, or ``None`` when not requested.
+            observation: the preprocessed observation used by the pass.
         """
         B = actions.shape[0]
         device = actions.device
@@ -466,7 +506,7 @@ class Pi0(model.BaseModel):
         )
 
         input_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
-        ar_mask = torch.cat([prefix_ar_mask, suffix_ar_mask], dim=0)
+        ar_mask = torch.cat([prefix_ar_mask, suffix_ar_mask], dim=1)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = torch.cumsum(input_mask.int(), dim=1) - 1
 
@@ -475,12 +515,96 @@ class Pi0(model.BaseModel):
             positions=positions,
             mask=attn_mask,
             adarms_cond=[None, adarms_cond],
-            return_prefix=False,
+            return_prefix=return_prefix,
         )[0]
 
         v_t = self.velocity_from_suffix(suffix_out[:, -self.action_horizon :])
+        return v_t, u_t, prefix_out, observation
 
+    def compute_loss(
+        self,
+        observation: model.Observation,
+        actions: torch.Tensor,
+        *,
+        train: bool = False,
+        rng: torch.Generator | None = None,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute flow matching loss.
+
+        Returns:
+            loss: (B, action_horizon, action_dim) per-element MSE
+        """
+        v_t, u_t, _, _ = self._flow_forward(
+            observation, actions, train=train, rng=rng, noise=noise, time=time
+        )
         return torch.square(v_t - u_t)
+
+    def compute_loss_terms(
+        self,
+        observation: model.Observation,
+        actions: torch.Tensor,
+        *,
+        train: bool = False,
+        rng: torch.Generator | None = None,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flow loss plus the subtask token cross-entropy.
+
+        Returns:
+            flow: (B, action_horizon, action_dim) per-element MSE.
+            subtask_ce: (B,) token cross-entropy, zeros when subtask prediction
+                is disabled.
+        """
+        v_t, u_t, prefix_out, processed = self._flow_forward(
+            observation,
+            actions,
+            train=train,
+            rng=rng,
+            noise=noise,
+            time=time,
+            return_prefix=True,
+        )
+        flow = torch.square(v_t - u_t)
+        if not self.train_subtask_prediction:
+            return flow, flow.new_zeros(flow.shape[0])
+        return flow, self.subtask_lm_loss(prefix_out, processed)
+
+    def subtask_lm_loss(
+        self, prefix_out: torch.Tensor, observation: model.Observation
+    ) -> torch.Tensor:
+        """Cross-entropy of the subtask tokens read out of the VLM prefix.
+
+        Only the positions flagged by ``token_loss_mask`` contribute; frames
+        without an annotation carry an all-False mask and return a zero loss.
+        """
+        if observation.tokenized_prompt is None:
+            raise ValueError("Tokenized prompt is required for subtask prediction")
+        if observation.token_loss_mask is None:
+            raise ValueError("Token loss mask is required for subtask prediction")
+
+        text_len = observation.tokenized_prompt.shape[1]
+        # Shift by one so every hidden state predicts its next token: the last
+        # prompt token before the first subtask token is included.
+        hidden = prefix_out[:, -text_len:-1]
+        targets = observation.tokenized_prompt[:, 1:]
+        mask = observation.token_loss_mask[:, 1:].to(torch.bool)
+        selected = torch.nonzero(mask, as_tuple=False)
+        if selected.numel() == 0:
+            return prefix_out.new_zeros(prefix_out.shape[0])
+
+        sample_idx = selected[:, 0]
+        token_idx = selected[:, 1]
+        logits = self.llm.embedder.decode(hidden[sample_idx, token_idx])
+        ce = F.cross_entropy(
+            logits.float(), targets[sample_idx, token_idx], reduction="none"
+        )
+        per_sample = logits.new_zeros((prefix_out.shape[0],), dtype=ce.dtype)
+        per_sample = per_sample.index_add(0, sample_idx, ce)
+        counts = mask.sum(dim=-1).to(ce.dtype).clamp(min=1.0)
+        return per_sample / counts
 
     def build_prefix_cache(
         self, observation: model.Observation
@@ -887,7 +1011,7 @@ class Pi0(model.BaseModel):
         )
 
         input_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
-        ar_mask = torch.cat([prefix_ar_mask, suffix_ar_mask], dim=0)
+        ar_mask = torch.cat([prefix_ar_mask, suffix_ar_mask], dim=1)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = torch.cumsum(input_mask.int(), dim=1) - 1
 
@@ -914,6 +1038,19 @@ class Pi0(model.BaseModel):
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
         if not self.rlt_cfg.use_rlt:
+            if self.train_subtask_prediction:
+                per_element_loss, subtask_ce = self.compute_loss_terms(
+                    observation, actions, train=True
+                )
+                vla_loss = self._reduce_sft_loss(
+                    per_element_loss, use_action_chunk_loss
+                )
+                subtask_loss = subtask_ce.mean()
+                return {
+                    "loss": vla_loss + self.subtask_loss_weight * subtask_loss,
+                    "vla_loss": vla_loss,
+                    "subtask_loss": subtask_loss,
+                }
             per_element_loss = self.compute_loss(observation, actions, train=True)
             return self._reduce_sft_loss(per_element_loss, use_action_chunk_loss)
 

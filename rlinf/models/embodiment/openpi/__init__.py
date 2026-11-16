@@ -125,6 +125,15 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     if max_token_len is not None:
         pi0_kwargs["max_token_len"] = int(max_token_len)
 
+    for key in ("train_subtask_prediction", "sample_subtask_prediction"):
+        value = OmegaConf.select(model_cfg, key, default=None)
+        if value is not None:
+            pi0_kwargs[key] = bool(value)
+    for key, cast in (("subtask_loss_weight", float), ("max_subtask_len", int)):
+        value = OmegaConf.select(model_cfg, key, default=None)
+        if value is not None:
+            pi0_kwargs[key] = cast(value)
+
     pi0_config = Pi0Config(**pi0_kwargs)
     rlt_cfg = build_rlt_config(model_cfg)
     runtime = {
@@ -424,7 +433,13 @@ def _resolve_data_kwargs(cfg):
     data_kwargs = OmegaConf.select(cfg, "openpi_data", default=None)
     if data_kwargs is not None:
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
-    return data_kwargs
+    else:
+        data_kwargs = {}
+    if OmegaConf.select(cfg, "openpi.sample_subtask_prediction", default=False):
+        # The serving pipeline needs the subtask tokenizer installed so the
+        # action branch can be conditioned on the generated text.
+        data_kwargs.setdefault("subtask_prediction", True)
+    return data_kwargs or None
 
 
 def _install_transforms(model, cfg, config_name: str):

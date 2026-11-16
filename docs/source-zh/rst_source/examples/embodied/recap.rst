@@ -659,6 +659,61 @@ Step 3 完成后，可以使用 ``examples/offline_rl/advantage_labeling/recap/p
 - ``episode_{N}_summary.png``：每个 episode 的关键帧 + 价值/优势时序图（高于阈值的帧用绿色边框标注）
 - ``episode_{N}.mp4``：带优势标注的逐帧回放视频
 
+Subtask 预测训练（可选）
+----------------------------------------
+
+在长时任务（如多零件抓取与放置）中，"当前应使用哪只手、抓取哪个物体、放入哪个 bin"
+通常由语言描述决定。pi0.5 的 subtask 阶段让 VLM 先预测当前子任务文本，动作专家再以该文本为条件，
+可以把这类信息从"靠视觉推断"变成"显式条件"。本实现只训练 token 级子任务交叉熵，**不包含分类头**。
+
+**数据要求**
+
+- 数据集目录下存在 ``meta/subtasks.jsonl``，每行一个 ``{"subtask_index", "subtask"}`` 记录；
+- 逐帧 parquet 中存在 ``subtask_index`` 列，``-1`` 表示该帧无标注（其子任务损失为 0）。
+
+**训练机制**
+
+- prompt 布局为 ``Task: <task>, State: <state>;\nSubtask: <subtask>;\nAction: ``；
+- 只有子任务 token（含 EOS）计入交叉熵，其余 prefix token 仅参与注意力；
+- 子任务 token 采用因果注意力，prefix 保持双向注意力；
+- 设备上的子任务标签只作为条件输入，与 advantage 的正负路由相互独立。
+
+**配置**
+
+.. code:: yaml
+
+   actor:
+     model:
+       openpi:
+         train_subtask_prediction: true
+         subtask_loss_weight: 1.0     # 子任务交叉熵相对动作损失的权重
+         max_subtask_len: 20          # 监督/生成子任务的最大 token 数
+
+开启后，训练日志会额外输出 ``subtask_loss``；CFG 训练还会输出 ``subtask_token_accuracy``。
+若数据集缺少 ``subtasks.jsonl``，所有帧会回退到普通 pi0.5 prompt，子任务损失恒为 0。
+
+.. note::
+
+   开启子任务后 prompt 布局发生变化（新增 ``Subtask: ...`` 段），位置编码整体平移，
+   已有 SFT checkpoint 不能无缝续训，应从 base 权重重新训练。
+
+**推理**
+
+推理分两阶段：先从 ``Task/State/\nSubtask: `` 前缀自回归生成子任务文本，再将生成的文本重新
+编码为上述训练布局，交给原有的去噪采样（RTC 与 CFG 引导保持不变）。服务端配置：
+
+.. code:: yaml
+
+   openpi:
+     sample_subtask_prediction: true
+     subtask_temperature: 0.0       # 0 为贪心解码
+     max_subtask_len: 20
+     subtask_refresh_steps: 50      # 每 N 次请求重新生成一次子任务
+
+子任务生成是动态长度循环，不能进入 CUDA Graph，因此按 ``subtask_refresh_steps`` 缓存：
+每个子任务段只生成一次（约每 24 秒），而不是每个动作 chunk 生成一次。新连接与 warmup
+结束时缓存会自动清空。
+
 运行
 ----------------------------------------
 

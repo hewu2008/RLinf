@@ -174,6 +174,12 @@ class OpenPi0Config(Pi0Config):
     guidance_type: str = "positive"
     positive_only_conditional: bool = False
 
+    # pi0.5 subtask prediction: a token-level cross-entropy on the subtask text.
+    # The classification head is intentionally not implemented.
+    train_subtask_prediction: bool = False
+    subtask_loss_weight: float = 1.0
+    max_subtask_len: int = 20
+
     def __post_init__(self):
         if self.guidance_type not in _VALID_GUIDANCE_TYPES:
             raise ValueError(
@@ -241,6 +247,9 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         super().__init__(config)
         self.sample_actions = sample_actions_func
         self.global_step = 0
+        self.train_subtask_prediction = bool(config.train_subtask_prediction)
+        self.subtask_loss_weight = float(config.subtask_loss_weight)
+        self.max_subtask_len = int(config.max_subtask_len)
         for name, module in self.named_modules():
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
@@ -260,14 +269,16 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         # instead of relying on a brittle hardcoded index
         self._tokenize_transform = None
         for t in self._input_transform.transforms:
-            if type(t).__name__ in ("TokenizePrompt", "TokenizePromptWithGuidance"):
+            if type(t).__name__ in (
+                "TokenizePrompt",
+                "TokenizePromptWithGuidance",
+                "TokenizePi05SubtaskInputs",
+                "TokenizePi05SubtaskGuidanceInputs",
+            ):
                 self._tokenize_transform = t
                 break
         if self._tokenize_transform is None:
-            raise ValueError(
-                "Cannot find TokenizePrompt or TokenizePromptWithGuidance "
-                "in input transforms"
-            )
+            raise ValueError("Cannot find a prompt tokenizer in input transforms")
 
     def input_transform(self, obs: dict, transpose=True):
         inputs = tree_map(lambda x: x, obs)
@@ -360,6 +371,38 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         """Default forward — delegates to forward()."""
         return self.forward(**kwargs)
 
+    def embed_prefix(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        token_ar_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Embed the prefix, honouring a per-sample autoregressive token mask.
+
+        The parent treats every prefix token as bidirectional. Subtask tokens
+        must attend causally, so their mask replaces the language segment.
+        """
+        embs, pad_masks, att_masks = super().embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        if token_ar_mask is None:
+            return embs, pad_masks, att_masks
+
+        token_ar_mask = token_ar_mask.to(torch.bool)
+        if token_ar_mask.dim() == 1:
+            token_ar_mask = token_ar_mask.unsqueeze(0).expand(att_masks.shape[0], -1)
+        num_lang = lang_tokens.shape[1]
+        num_img = att_masks.shape[1] - num_lang
+        if num_img < 0:
+            raise ValueError(
+                f"Prefix has {att_masks.shape[1]} tokens but the language segment "
+                f"alone is {num_lang}; cannot place the token AR mask."
+            )
+        att_masks = torch.cat([att_masks[:, :num_img], token_ar_mask], dim=1)
+        return embs, pad_masks, att_masks
+
     def _compute_flow_losses(
         self,
         images,
@@ -371,7 +414,8 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         device,
         time=None,
         noise=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_ar_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute flow loss and detached per-sample loss for a language route."""
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
@@ -388,7 +432,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, token_ar_mask=token_ar_mask
         )
 
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
@@ -413,7 +457,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         def forward_func(
             prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         ):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -421,9 +465,9 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func,
             prefix_embs,
             suffix_embs,
@@ -441,7 +485,38 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         per_element_loss = F.mse_loss(u_t, v_t, reduction="none")
         flow_loss = per_element_loss.mean()
         per_sample_loss = per_element_loss.detach().mean(dim=(-1, -2))
-        return flow_loss, per_sample_loss
+        return flow_loss, per_sample_loss, prefix_out
+
+    def subtask_lm_loss(
+        self,
+        prefix_out: torch.Tensor,
+        tokenized_prompt: torch.Tensor,
+        token_loss_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        """Cross-entropy of the subtask tokens read out of the VLM prefix.
+
+        Returns:
+            loss: scalar mean over the supervised subtask tokens.
+            accuracy: argmax token accuracy on the same positions.
+        """
+        text_len = tokenized_prompt.shape[1]
+        # Shift by one so every hidden state predicts its next token.
+        hidden = prefix_out[:, -text_len:-1]
+        targets = tokenized_prompt[:, 1:]
+        mask = token_loss_mask[:, 1:].to(torch.bool)
+        selected = torch.nonzero(mask, as_tuple=False)
+        if selected.numel() == 0:
+            return prefix_out.new_zeros(()), 0.0
+
+        sample_idx = selected[:, 0]
+        token_idx = selected[:, 1]
+        logits = self.paligemma_with_expert.paligemma.lm_head(
+            hidden[sample_idx, token_idx]
+        )
+        target = targets[sample_idx, token_idx]
+        ce = F.cross_entropy(logits.float(), target, reduction="none")
+        accuracy = (logits.argmax(dim=-1) == target).float().mean().item()
+        return ce.mean(), accuracy
 
     @staticmethod
     def _masked_loss_sum(per_sample_loss: torch.Tensor, mask: torch.Tensor) -> float:
@@ -552,7 +627,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             noise = kwargs.get("noise")
         else:
             noise = self.sample_noise(actions.shape, device)
-        flow_loss, per_sample_loss = self._compute_flow_losses(
+        flow_loss, per_sample_loss, prefix_out = self._compute_flow_losses(
             images=images,
             img_masks=img_masks,
             state=state,
@@ -562,6 +637,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             device=device,
             time=time,
             noise=noise,
+            token_ar_mask=getattr(observation, "token_ar_mask", None),
         )
 
         conditional_count = conditional_mask.sum().item()
@@ -598,7 +674,17 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             ),
         }
 
-        return flow_loss, metrics
+        total_loss = flow_loss
+        token_loss_mask = getattr(observation, "token_loss_mask", None)
+        if self.train_subtask_prediction and token_loss_mask is not None:
+            subtask_loss, subtask_accuracy = self.subtask_lm_loss(
+                prefix_out, observation.tokenized_prompt, token_loss_mask
+            )
+            total_loss = flow_loss + self.subtask_loss_weight * subtask_loss
+            metrics["subtask_loss"] = float(subtask_loss.detach().item())
+            metrics["subtask_token_accuracy"] = subtask_accuracy
+
+        return total_loss, metrics
 
     def obs_processor(self, env_obs):
         processed_obs = {

@@ -46,7 +46,7 @@ from rlinf.models.embodiment.openpi.apxinf_adapter import (
     _active_token_ids,
 )
 from rlinf.models.embodiment.openpi.modules.model import IMAGE_KEYS, Observation
-from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop
+from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop, make_attn_mask
 from rlinf.models.embodiment.openpi.sampling import rl_sampler
 from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
     RTCGuidanceContext,
@@ -55,6 +55,13 @@ from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
     sample_actions_with_rtc_guidance,
 )
 from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval, advantage_prompts
+from rlinf.models.embodiment.openpi.transforms.subtask import (
+    SubtaskFromIndex,
+    SubtaskPaligemmaTokenizer,
+    TokenizePi05SubtaskGuidanceInputs,
+    TokenizePi05SubtaskInputs,
+    load_subtasks,
+)
 from rlinf.scheduler import Worker
 from rlinf.utils.env_helpers import HistoryManager
 from rlinf.utils.env_helpers.delay_sampler import (
@@ -3517,3 +3524,199 @@ def test_lingbotvlav2_smoke_config_composes(monkeypatch):
     )
     assert cfg.algorithm.adv_type == "gae" and cfg.algorithm.loss_type == "actor_critic"
     assert cfg.runner.max_steps == 2 and cfg.env.train.total_num_envs == 4
+
+
+class _FakeSentencePiece:
+    """Deterministic stand-in for sentencepiece (no model download in CI)."""
+
+    def encode(self, text, add_bos=False, add_eos=False):
+        ids = [10 + (ord(ch) % 20) for ch in text]
+        if add_bos:
+            ids = [1] + ids
+        if add_eos:
+            ids = ids + [1]
+        return ids
+
+    def decode(self, ids):
+        return " ".join(str(int(token)) for token in ids)
+
+
+class _FakeBaseTokenizer:
+    def __init__(self, max_len: int = 64):
+        self._tokenizer = _FakeSentencePiece()
+        self._max_len = max_len
+
+
+def _subtask_tokenizer(max_len: int = 256) -> SubtaskPaligemmaTokenizer:
+    return SubtaskPaligemmaTokenizer(_FakeBaseTokenizer(max_len), max_len=max_len)
+
+
+def test_load_subtasks_reads_meta_jsonl_and_defaults_to_empty(tmp_path):
+    assert load_subtasks(tmp_path) == {}
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    (meta / "subtasks.jsonl").write_text(
+        '{"subtask_index": 0, "subtask": "home"}\n\n'
+        '{"subtask_index": 3, "subtask": "pick the pipe"}\n'
+    )
+    assert load_subtasks(tmp_path) == {0: "home", 3: "pick the pipe"}
+
+
+def test_subtask_from_index_maps_missing_and_unknown_to_empty():
+    transform = SubtaskFromIndex({2: "pick"})
+    assert transform({"subtask_index": 2})["subtask"] == "pick"
+    assert transform({"subtask_index": -1})["subtask"] == ""
+    assert transform({"subtask_index": 9})["subtask"] == ""
+    assert transform({})["subtask"] == ""
+
+
+def test_subtask_tokenizer_marks_only_the_subtask_for_loss():
+    tokenizer = _subtask_tokenizer()
+    tokens, token_mask, ar_mask, loss_mask = tokenizer.tokenize_subtask_training(
+        "sort objects", "pick the pipe", None, max_subtask_len=8
+    )
+    prefix_len = len(tokenizer.encode_subtask_prefix("sort objects", None))
+    subtask_len = int(loss_mask.sum())
+    cue_len = int(token_mask.sum()) - prefix_len - subtask_len
+
+    assert tokens.shape == (256,)
+    assert prefix_len > 0 and subtask_len > 0 and cue_len > 0
+    assert int(ar_mask.sum()) == subtask_len + cue_len
+    assert tokens[loss_mask][-1] == 1
+    assert not loss_mask[:prefix_len].any()
+
+
+def test_subtask_tokenizer_truncation_keeps_eos():
+    tokenizer = _subtask_tokenizer()
+    tokens, _, _, loss_mask = tokenizer.tokenize_subtask_training(
+        "task", "a very long subtask description", None, max_subtask_len=3
+    )
+    assert int(loss_mask.sum()) == 3
+    assert tokens[loss_mask][-1] == 1
+
+
+def test_tokenize_pi05_subtask_inputs_three_modes():
+    tokenizer = _subtask_tokenizer()
+    transform = TokenizePi05SubtaskInputs(tokenizer=tokenizer, max_subtask_len=8)
+
+    labelled = transform({"prompt": "task", "subtask": "pick"})
+    assert int(labelled["token_loss_mask"].sum()) > 0
+
+    unlabelled = transform({"prompt": "task", "subtask": ""})
+    assert int(unlabelled["token_loss_mask"].sum()) == 0
+    assert int(unlabelled["token_ar_mask"].sum()) == 0
+
+    serving = transform({"prompt": "task"})
+    assert "token_loss_mask" not in serving
+    assert int(serving["token_ar_mask"].sum()) > 0
+
+
+def test_subtask_guidance_inputs_keep_one_subtask_per_branch():
+    tokenizer = _subtask_tokenizer()
+    transform = TokenizePi05SubtaskGuidanceInputs(
+        tokenizer=tokenizer, max_subtask_len=8
+    )
+    out = transform({"prompt": "task", "subtask": "pick"})
+    for key in (
+        "tokenized_prompt",
+        "tokenized_positive_guidance_prompt",
+        "tokenized_negative_guidance_prompt",
+    ):
+        assert out[key].shape == (256,)
+    assert int(out["token_loss_mask"].sum()) > 0
+
+
+def test_subtask_lm_loss_only_scores_the_masked_tokens():
+    fake_llm = SimpleNamespace(embedder=SimpleNamespace(decode=lambda x: x))
+    model = SimpleNamespace(llm=fake_llm)
+    observation = SimpleNamespace(
+        tokenized_prompt=torch.tensor([[10, 2, 3, 4]]),
+        token_loss_mask=torch.tensor([[False, False, True, True]]),
+    )
+    hidden = torch.zeros(1, 3, 5)
+    hidden[0, 1, 3] = 10.0
+    hidden[0, 2, 4] = 10.0
+    prefix_out = torch.zeros(1, 6, 5)
+    prefix_out[:, -4:-1] = hidden
+
+    loss = Pi0.subtask_lm_loss(model, prefix_out, observation)
+    assert loss.shape == (1,)
+    assert loss.item() < 0.1
+
+    observation.token_loss_mask = torch.zeros(1, 4, dtype=torch.bool)
+    zero_loss = Pi0.subtask_lm_loss(model, prefix_out, observation)
+    assert torch.count_nonzero(zero_loss) == 0
+
+
+def test_compute_loss_terms_returns_zero_without_subtask():
+    fake = SimpleNamespace(
+        train_subtask_prediction=False,
+        _flow_forward=lambda *args, **kwargs: (
+            torch.zeros(1, 2, 3),
+            torch.zeros(1, 2, 3),
+            None,
+            None,
+        ),
+    )
+    flow, ce = Pi0.compute_loss_terms(fake, None, torch.zeros(1, 2, 3))
+    assert flow.shape == (1, 2, 3)
+    assert ce.shape == (1,)
+    assert torch.count_nonzero(ce) == 0
+
+
+def test_make_attn_mask_supports_per_sample_ar_masks():
+    input_mask = torch.ones(2, 3, dtype=torch.bool)
+    ar_mask = torch.tensor([[0, 0, 1], [0, 1, 1]], dtype=torch.bool)
+    attn = make_attn_mask(input_mask, ar_mask)
+    assert attn.shape == (2, 3, 3)
+    assert attn[0, 0].tolist() == [True, True, False]
+    assert attn[0, 2].tolist() == [True, True, True]
+    assert attn[1, 1].tolist() == [True, True, False]
+
+
+class _FakeGenLLM:
+    def __init__(self):
+        self.calls = 0
+        self.embedder = SimpleNamespace(decode=self._decode)
+
+    def embed(self, tokens):
+        return torch.zeros(tokens.shape[0], tokens.shape[1], 4)
+
+    def _decode(self, hidden):
+        logits = torch.zeros(hidden.shape[0], 8)
+        logits[:, 1] = 5.0
+        return logits
+
+    def __call__(self, embedded, **kwargs):
+        self.calls += 1
+        hidden = torch.zeros(embedded[0].shape[0], embedded[0].shape[1], 4)
+        return [hidden, None], ("kv",)
+
+
+def test_generate_subtask_stops_at_eos():
+    fake_llm = _FakeGenLLM()
+    model = SimpleNamespace(
+        llm=fake_llm,
+        _subtask_tokenizer=_subtask_tokenizer(),
+        max_subtask_len=4,
+        subtask_temperature=0.0,
+    )
+    observation = SimpleNamespace(state=torch.zeros(1, 32))
+    text = Pi0Eval.generate_subtask(model, observation, "task")
+    assert text == ""
+    assert fake_llm.calls == 1
+
+
+def test_with_subtask_tokens_swaps_the_prompt_layout():
+    model = SimpleNamespace(_subtask_tokenizer=_subtask_tokenizer(), max_subtask_len=8)
+    observation = Observation(
+        images={key: torch.zeros(1, 224, 224, 3) for key in IMAGE_KEYS},
+        image_masks={key: torch.ones(1, dtype=torch.bool) for key in IMAGE_KEYS},
+        state=torch.zeros(1, 32),
+        tokenized_prompt=torch.zeros(1, 64, dtype=torch.long),
+        tokenized_prompt_mask=torch.ones(1, 64, dtype=torch.bool),
+    )
+    updated = Pi0Eval._with_subtask_tokens(model, observation, "task", "pick")
+    assert updated.token_ar_mask.shape == (1, 256)
+    assert int(updated.token_ar_mask.sum()) > 0
+    assert updated.token_loss_mask is None

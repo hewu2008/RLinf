@@ -129,7 +129,14 @@ class PolicyService:
 
     def new_session(self) -> RTCSession:
         """Create the state of a fresh connection."""
+        self.reset_subtask_cache()
         return RTCSession()
+
+    def reset_subtask_cache(self) -> None:
+        """Drop the generated subtask so a new connection starts fresh."""
+        reset = getattr(self._model, "reset_subtask_cache", None)
+        if callable(reset):
+            reset()
 
     def warmup(self, steps: int = 1) -> None:
         """Run synthetic observations so the first real request is not the first compile."""
@@ -154,6 +161,9 @@ class PolicyService:
             )
             self._model.disable_sampler_graph()
             self._run_warmup(observation, steps)
+        finally:
+            # The synthetic prompt must not leak into the first real request.
+            self.reset_subtask_cache()
 
     def _run_warmup(self, observation: Mapping[str, Any], steps: int) -> None:
         session = RTCSession()
@@ -243,20 +253,25 @@ class PolicyService:
         # request; plain requests only show up under DEBUG.
         log = logger.info if self._cfg_scale > 0.0 else logger.debug
         log(
-            "chunk %d: cfg_scale=%.2f guidance_type=%s rtc=%s actions=%s infer=%.3fs",
+            "chunk %d: cfg_scale=%.2f guidance_type=%s rtc=%s actions=%s "
+            "subtask=%s infer=%.3fs",
             chunk_id,
             self._cfg_scale,
             self._guidance_type,
             rtc_desc,
             tuple(chunk.shape),
+            result.get("subtask"),
             time.monotonic() - start,
         )
-        return {
+        response = {
             "actions": chunk,
             "chunk_id": chunk_id,
             "guidance_applied": rtc_context is not None,
             "infer_time": time.monotonic() - start,
         }
+        if result.get("subtask") is not None:
+            response["subtask"] = result["subtask"]
+        return response
 
     def _build_model(self, cfg: DictConfig) -> torch.nn.Module:
         from rlinf.models import get_model

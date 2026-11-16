@@ -15,13 +15,20 @@
 
 import dataclasses
 import pathlib
+from typing import Mapping
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.transforms as _transforms
 from openpi.training.config import DataConfig, DataConfigFactory, ModelTransformFactory
 from typing_extensions import override
 
 from rlinf.models.embodiment.openpi.policies import zerith_policy
+from rlinf.models.embodiment.openpi.transforms.subtask import (
+    SubtaskFromIndex,
+    SubtaskPaligemmaTokenizer,
+    TokenizePi05SubtaskInputs,
+)
 from rlinf.models.embodiment.openpi.transforms.zero_dims import ZeroDims
 
 # 23-dim layout: left arm 0-6, left gripper 7, right arm 8-14, right gripper 15,
@@ -34,6 +41,36 @@ ZERITH_DELTA_ACTION_MASK = _transforms.make_bool_mask(7, -1, 7, -1, 5, -2)
 ZERITH_ZEROED_DIMS = (21, 22)
 
 
+def _replace_tokenize_prompt(
+    model_transforms: _transforms.Group,
+    base_tokenizer: _tokenizer.PaligemmaTokenizer,
+    model_config: _model.BaseModelConfig,
+    max_subtask_len: int,
+) -> _transforms.Group:
+    """Swap the plain pi0.5 prompt tokenizer for the subtask-aware one."""
+    replacement = TokenizePi05SubtaskInputs(
+        tokenizer=SubtaskPaligemmaTokenizer(
+            base_tokenizer, max_len=model_config.max_token_len
+        ),
+        discrete_state_input=bool(model_config.discrete_state_input),
+        max_subtask_len=max_subtask_len,
+    )
+    inputs = []
+    replaced = False
+    for transform in model_transforms.inputs:
+        if type(transform).__name__ == "TokenizePrompt":
+            inputs.append(replacement)
+            replaced = True
+        else:
+            inputs.append(transform)
+    if not replaced:
+        raise ValueError(
+            "ModelTransformFactory did not emit a TokenizePrompt transform; "
+            f"got {[type(t).__name__ for t in model_transforms.inputs]}."
+        )
+    return _transforms.Group(inputs=inputs, outputs=model_transforms.outputs)
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotZerithDataConfig(DataConfigFactory):
     """LeRobot transforms for Zerith H1 Pro datasets."""
@@ -42,25 +79,36 @@ class LeRobotZerithDataConfig(DataConfigFactory):
     default_prompt: str | None = None
     # pi0/pi05 train on delta actions; disabling keeps the raw absolute actions.
     extra_delta_transform: bool = True
+    # Train pi0.5 to predict the per-frame subtask as text. Requires
+    # ``meta/subtasks.jsonl`` and a per-frame ``subtask_index`` column.
+    subtask_prediction: bool = False
+    # Loaded ``subtask_index -> text`` mapping; empty disables the subtask loss
+    # for every frame (plain pi0.5 behaviour).
+    subtasks: Mapping[int, str] | None = None
+    # Cap on the supervised/generated subtask length.
+    max_subtask_len: int = 20
 
     @override
     def create(
         self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
     ) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "observation.images.cam_high",
-                        "observation/left_wrist_image": "observation.images.cam_left_wrist",
-                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        subtask = self.subtask_prediction
+        repack_structure = {
+            "observation/image": "observation.images.cam_high",
+            "observation/left_wrist_image": "observation.images.cam_left_wrist",
+            "observation/right_wrist_image": "observation.images.cam_right_wrist",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        repack_inputs = []
+        if subtask:
+            # Runs before the repack so it reads the raw `subtask_index` column;
+            # the whitelist below keeps the mapped text alive.
+            repack_structure["subtask"] = "subtask"
+            repack_inputs.append(SubtaskFromIndex(self.subtasks or {}))
+        repack_inputs.append(_transforms.RepackTransform(repack_structure))
+        repack_transform = _transforms.Group(inputs=repack_inputs)
 
         data_transforms = _transforms.Group(
             inputs=[
@@ -90,6 +138,13 @@ class LeRobotZerithDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(
             model_config
         )
+        if subtask:
+            model_transforms = _replace_tokenize_prompt(
+                model_transforms,
+                _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                model_config,
+                self.max_subtask_len,
+            )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),

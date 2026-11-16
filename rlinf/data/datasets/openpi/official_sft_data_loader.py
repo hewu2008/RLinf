@@ -26,6 +26,9 @@ from rlinf.models.embodiment.openpi.transforms.pipeline import (
     norm_stats_path_from_data_kwargs,
     select_openpi_norm_stats,
 )
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
 
 
 def build_official_openpi_sft_dataloader(
@@ -66,6 +69,7 @@ def build_official_openpi_sft_dataloader(
         repo_id=repo_id,
         data_kwargs=data_kwargs,
     )
+    config = _with_subtask_labels(model_cfg, config, repo_id)
     config = dataclasses.replace(
         config,
         num_workers=int(
@@ -79,6 +83,41 @@ def build_official_openpi_sft_dataloader(
         config, framework="pytorch", shuffle=not eval_dataset
     )
     return data_loader, data_loader.data_config()
+
+
+def _with_subtask_labels(model_cfg: Any, config: Any, repo_id: str) -> Any:
+    """Enable per-frame subtask labels on the OpenPI data config.
+
+    The mapping is loaded from ``<dataset>/meta/subtasks.jsonl``; an empty
+    mapping keeps every frame on the plain pi0.5 prompt, so a dataset without
+    annotations trains exactly like before.
+    """
+    if not bool(
+        OmegaConf.select(model_cfg, "openpi.train_subtask_prediction", default=False)
+    ):
+        return config
+    if not hasattr(config.data, "subtask_prediction"):
+        raise ValueError(
+            "actor.model.openpi.train_subtask_prediction is set but "
+            f"{type(config.data).__name__} has no 'subtask_prediction' field."
+        )
+
+    from rlinf.data.storage.lerobot import resolve_lerobot_dataset_root
+    from rlinf.models.embodiment.openpi.transforms.subtask import load_subtasks
+
+    subtasks = load_subtasks(resolve_lerobot_dataset_root(repo_id))
+    if not subtasks:
+        logger.warning(
+            "train_subtask_prediction is enabled but no meta/subtasks.jsonl was "
+            "found under %s; every frame will train on the plain pi0.5 prompt.",
+            repo_id,
+        )
+    return dataclasses.replace(
+        config,
+        data=dataclasses.replace(
+            config.data, subtask_prediction=True, subtasks=subtasks
+        ),
+    )
 
 
 def get_official_openpi_sft_num_batches(data_loader: Any) -> int:

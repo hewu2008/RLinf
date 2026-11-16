@@ -32,3 +32,12 @@ openpi:
   value_after_vlm: False
   value_vlm_mode: "mean_token"
   detach_critic_input: null
+  # pi0.5 subtask prediction: the VLM predicts the per-frame subtask text and
+  # the action expert is conditioned on it. Needs meta/subtasks.jsonl and a
+  # subtask_index column; the classification head is not implemented.
+  train_subtask_prediction: False
+  sample_subtask_prediction: False
+  subtask_loss_weight: 1.0
+  max_subtask_len: 20
+  subtask_temperature: 0.0
+  subtask_refresh_steps: 50

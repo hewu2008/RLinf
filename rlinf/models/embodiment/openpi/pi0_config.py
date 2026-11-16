@@ -38,11 +38,31 @@ class Pi0Config:
     discrete_state_input: bool | None = None
     pcd: bool = False
 
+    # pi0.5 high-level subtask prediction: the VLM predicts the current subtask
+    # as text and the action expert is conditioned on it. The classification
+    # head is intentionally not implemented; training is a token-level CE.
+    train_subtask_prediction: bool = False
+    sample_subtask_prediction: bool = False
+    # Weight of the subtask cross-entropy added to the flow-matching loss.
+    subtask_loss_weight: float = 1.0
+    # Slots reserved for the generated subtask; also caps the supervised length.
+    max_subtask_len: int = 20
+    # 0.0 selects the argmax token (greedy), > 0.0 samples with logits / T.
+    subtask_temperature: float = 0.0
+    # Regenerate the cached subtask after this many requests (serving only).
+    subtask_refresh_steps: int = 50
+
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:
             object.__setattr__(self, "max_token_len", 200)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if (
+            self.train_subtask_prediction or self.sample_subtask_prediction
+        ) and not self.pi05:
+            raise ValueError(
+                "subtask prediction requires a pi0.5 model; got pi05=False."
+            )
 
     def fake_obs(self, batch_size: int = 1) -> model.Observation:
         image = torch.ones(batch_size, *model.IMAGE_RESOLUTION, 3)

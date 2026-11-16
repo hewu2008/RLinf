@@ -46,3 +46,11 @@ openpi:
   paligemma_variant: "gemma_2b"
   action_expert_variant: "gemma_300m"
   max_token_len: 200
+  # pi0.5 subtask prediction (token-level CE, no classification head). The
+  # dataset must ship meta/subtasks.jsonl and a per-frame subtask_index column.
+  train_subtask_prediction: False
+  sample_subtask_prediction: False
+  subtask_loss_weight: 1.0
+  max_subtask_len: 20
+  subtask_temperature: 0.0
+  subtask_refresh_steps: 50

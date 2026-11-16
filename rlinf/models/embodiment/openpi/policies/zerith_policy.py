@@ -97,6 +97,14 @@ class ZerithInputs(transforms.DataTransformFn):
                 prompt.decode("utf-8") if isinstance(prompt, bytes) else prompt
             )
 
+        # Forward the per-frame subtask text (pi0.5 subtask prediction) to the
+        # model transforms, which build the subtask token layout from it.
+        if "subtask" in data:
+            subtask = data["subtask"]
+            inputs["subtask"] = (
+                subtask.decode("utf-8") if isinstance(subtask, bytes) else subtask
+            )
+
         return inputs
 
 
