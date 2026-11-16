@@ -60,7 +60,7 @@ fi
 
 # shellcheck disable=SC2086  # launcher is a command prefix, empty when unused.
 ${launcher} "${PYTHON}" -m inference.client.replay \
-  --episode "${EPISODE:?set EPISODE to an episode.hdf5 path or its directory}" \
+  --episode "/home/robot/hewu/alg-product/RLinf/rollouts/e03d597e60474514ac2fe94fb0c47550/episode.hdf5" \
   --fixed_rate "${RATE:-30}" \
   --speed "${SPEED:-1.0}" \
   ${DEINIT:+--deinit} \

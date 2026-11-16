@@ -59,7 +59,7 @@ openpi:
   # value keeps both branches in the denoise loop, and 1.5 extrapolates past the
   # conditioned branch with a -0.5 weight on the plain one. --cfg-beta overrides
   # it. Per-denoise-step guidance norms are logged at RLINF_LOG_LEVEL=DEBUG.
-  cfgrl_guidance_scale: 1.5
+  cfgrl_guidance_scale: 1.0
   guidance_type: positive
   # Serve the RTC denoise loop from a captured CUDA graph: one replay per
   # chunk instead of thousands of kernel launches, with the eager numbers kept
