@@ -727,10 +727,10 @@ CFG guidance are unchanged). Server configuration:
      subtask_temperature: 0.0       # 0.0 is greedy decoding
      max_subtask_len: 20
 
-Subtask generation is a dynamic-length loop that cannot enter a CUDA graph, so the result is
-cached per prompt: it is reused while the prompt is unchanged and regenerated when the client
-switches the prompt or resets the cache explicitly. New connections and the end of warmup clear
-the cache.
+Subtask generation is a dynamic-length loop that cannot enter a CUDA graph and depends on the
+current observation, so it is regenerated on every request. One generation takes about 200-330 ms
+(depending on ``max_subtask_len`` and whether EOS comes early), roughly ten control periods at
+30 Hz; keep ``max_subtask_len`` at 12-16 and leave enough RTC execution horizon.
 
 Run It
 ------

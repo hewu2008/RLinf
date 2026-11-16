@@ -112,10 +112,8 @@ class Pi0Eval(EnvIO, Pi0):
         self._rtc_action_anchor = None
         self._rtc_anchor_mismatch_logged = False
         # Subtask generation state: the tokenizer is installed with the input
-        # pipeline, and the cache skips regeneration for every request.
+        # pipeline.
         self._subtask_tokenizer: SubtaskPaligemmaTokenizer | None = None
-        self._subtask_cache: str | None = None
-        self._subtask_cache_prompt: str | None = None
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
             "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
@@ -152,11 +150,9 @@ class Pi0Eval(EnvIO, Pi0):
         prompt = None
         if self.sample_subtask_prediction:
             prompt = self._prompt_from_env_obs(env_obs)
-            subtask = self._cached_subtask(prompt)
-            if subtask is None:
-                subtask = self.generate_subtask(observation, prompt)
-                self._subtask_cache = subtask
-                self._subtask_cache_prompt = prompt
+            # Regenerate from the current observation on every request: the
+            # subtask depends on what the cameras see, which changes per frame.
+            subtask = self.generate_subtask(observation, prompt)
             observation = self._with_subtask_tokens(observation, prompt, subtask)
             cond_observation = None
             if self.cfgrl_guidance_scale > 0.0:
@@ -396,22 +392,6 @@ class Pi0Eval(EnvIO, Pi0):
             ],
             token_loss_mask=None,
         )
-
-    def reset_subtask_cache(self) -> None:
-        """Drop the cached subtask; call when a new episode starts."""
-        self._subtask_cache = None
-        self._subtask_cache_prompt = None
-
-    def _cached_subtask(self, prompt: str) -> str | None:
-        """Reuse the cached subtask while the prompt is unchanged.
-
-        Regeneration is event driven: a new prompt or an explicit
-        :meth:`reset_subtask_cache` invalidates the cache. Without such an
-        event the subtask stays fixed for the connection.
-        """
-        if self._subtask_cache is None or prompt != self._subtask_cache_prompt:
-            return None
-        return self._subtask_cache
 
     def setup_transforms(
         self,

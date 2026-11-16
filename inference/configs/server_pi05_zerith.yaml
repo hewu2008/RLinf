@@ -54,9 +54,9 @@ openpi:
   rtc_guidance_clip: 5.0
   # pi0.5 subtask stage: generate the subtask text from the prefix and
   # condition the action branch on it. Requires a checkpoint trained with
-  # train_subtask_prediction. The generated subtask is cached until the prompt
-  # changes (or a new connection starts), so the autoregressive loop does not
-  # run per chunk; it cannot enter the CUDA graph.
+  # train_subtask_prediction. The subtask is regenerated on every request from
+  # the current observation (the loop cannot enter the CUDA graph); keep
+  # max_subtask_len small to stay inside the control-period budget.
   sample_subtask_prediction: false
   subtask_temperature: 0.0
   max_subtask_len: 20
