@@ -213,8 +213,25 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             train_metrics = all_reduce_dict(
                 train_metrics, op=torch.distributed.ReduceOp.AVG
             )
+            self._log_subtask_metrics(train_metrics)
 
             return train_metrics
+
+    def _log_subtask_metrics(self, train_metrics: dict[str, float]) -> None:
+        """Print the subtask loss on its own line every ``log_interval`` steps."""
+        if "subtask_loss" not in train_metrics or self._rank != 0:
+            return
+        log_interval = int(self.cfg.runner.get("log_interval", 1))
+        if log_interval < 1 or (self.global_step + 1) % log_interval != 0:
+            return
+        parts = [
+            f"step={self.global_step + 1}",
+            f"subtask_loss={train_metrics['subtask_loss']:.6f}",
+        ]
+        for key in ("vla_loss", "subtask_token_accuracy"):
+            if key in train_metrics:
+                parts.append(f"{key}={train_metrics[key]:.6f}")
+        self.log_info("[subtask] " + " ".join(parts))
 
     @abstractmethod
     def build_dataloader(self):

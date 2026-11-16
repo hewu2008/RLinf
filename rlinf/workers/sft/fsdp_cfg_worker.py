@@ -616,6 +616,7 @@ class FSDPCfgWorker(FSDPSftWorker):
                     op=torch.distributed.ReduceOp.AVG,
                 )
 
+            self._log_subtask_metrics(train_metrics)
             return train_metrics
 
     def set_global_step(self, global_step):
