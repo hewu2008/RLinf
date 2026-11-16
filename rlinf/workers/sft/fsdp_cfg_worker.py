@@ -168,21 +168,45 @@ class FSDPCfgWorker(FSDPSftWorker):
                 default=False,
             )
         )
+        data_kwargs = OmegaConf.select(
+            self.cfg.actor.model, "openpi_data", default=None
+        )
+        if data_kwargs is not None:
+            data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
         config = get_openpi_config(
             openpi_cfg.config_name,
             model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.actor.micro_batch_size * self._world_size,
             repo_id=first_path,
-            data_kwargs=OmegaConf.select(
-                self.cfg.actor.model, "openpi_data", default=None
-            ),
+            data_kwargs=data_kwargs,
         )
         if train_subtask:
             config = self._with_subtask_labels(config, first_path)
         data_config = config.data.create(config.assets_dirs, config.model)
 
         model_transforms = self._build_model_transforms(data_config, train_subtask)
-        norm_stats = data_config.norm_stats or {}
+        # ``create_base_config`` only looks under its default assets dir, so a
+        # pinned ``openpi_data.norm_stats_path`` has to be applied here for the
+        # training Normalize transform to see it.
+        from rlinf.models.embodiment.openpi.transforms.pipeline import (
+            norm_stats_path_from_data_kwargs,
+            select_openpi_norm_stats,
+        )
+
+        norm_stats_path = norm_stats_path_from_data_kwargs(data_kwargs)
+        norm_stats = select_openpi_norm_stats(
+            data_config.norm_stats,
+            norm_stats_path=norm_stats_path,
+        )
+        if not norm_stats:
+            self.log_warning(
+                "No norm stats loaded; actions/states train unnormalized. Set "
+                "actor.model.openpi_data.norm_stats_path."
+            )
+        else:
+            self.log_info(
+                f"Loaded norm stats for {sorted(norm_stats)} from {norm_stats_path}"
+            )
 
         datasets_with_weights = []
         for ds_config in datasets_config:
