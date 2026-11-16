@@ -70,7 +70,7 @@ actor:
       # Token-level subtask prediction (no classification head).
       train_subtask_prediction: true
       subtask_loss_weight: 1.0
-      max_subtask_len: 20
+      max_subtask_len: 24
 
   optim:
     lr: 1.0e-4

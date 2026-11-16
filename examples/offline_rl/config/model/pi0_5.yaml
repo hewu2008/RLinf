@@ -38,6 +38,6 @@ openpi:
   train_subtask_prediction: False
   sample_subtask_prediction: False
   subtask_loss_weight: 1.0
-  max_subtask_len: 20
+  max_subtask_len: 24
   subtask_temperature: 0.0
   subtask_decode_graph: True

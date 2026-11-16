@@ -59,7 +59,7 @@ openpi:
   # max_subtask_len small to stay inside the control-period budget.
   sample_subtask_prediction: false
   subtask_temperature: 0.0
-  max_subtask_len: 20
+  max_subtask_len: 24
   # Replay each decode step from a captured CUDA graph (falls back to eager
   # without CUDA). Measured 15 ms -> 6 ms per token on the 2B model.
   subtask_decode_graph: true
