@@ -155,6 +155,9 @@ def reanchor_prev_actions(
     shift = (prev_state[..., :dims].to(cur_phys) - cur_phys) / action_scale
     shift = torch.where(delta_mask, shift, torch.zeros_like(shift))
     reanchored = prev_actions.clone()
+    # The leftover is owned by the caller and stays on the host between requests,
+    # while ``cur_state`` and the statistics live on the model device.
+    shift = shift.to(device=reanchored.device, dtype=reanchored.dtype)
     reanchored[..., :dims] += shift.unsqueeze(-2)
     return reanchored
 
