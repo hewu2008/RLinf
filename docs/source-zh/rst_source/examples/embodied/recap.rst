@@ -710,11 +710,9 @@ Subtask 预测训练（可选）
      sample_subtask_prediction: true
      subtask_temperature: 0.0       # 0 为贪心解码
      max_subtask_len: 20
-     subtask_refresh_steps: 50      # 每 N 次请求重新生成一次子任务
 
-子任务生成是动态长度循环，不能进入 CUDA Graph，因此按 ``subtask_refresh_steps`` 缓存：
-每个子任务段只生成一次（约每 24 秒），而不是每个动作 chunk 生成一次。新连接与 warmup
-结束时缓存会自动清空。
+子任务生成是动态长度循环，不能进入 CUDA Graph，因此结果按 prompt 缓存：prompt 不变时
+复用，客户端切换 prompt 或显式重置时重新生成；新连接与 warmup 结束时缓存自动清空。
 
 运行
 ----------------------------------------

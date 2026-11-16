@@ -726,11 +726,11 @@ CFG guidance are unchanged). Server configuration:
      sample_subtask_prediction: true
      subtask_temperature: 0.0       # 0.0 is greedy decoding
      max_subtask_len: 20
-     subtask_refresh_steps: 50      # regenerate the subtask every N requests
 
-Subtask generation is a dynamic-length loop that cannot enter a CUDA graph, so the result is cached
-for ``subtask_refresh_steps`` requests: one generation per subtask segment (about every 24 seconds)
-instead of one per action chunk. New connections and the end of warmup clear the cache.
+Subtask generation is a dynamic-length loop that cannot enter a CUDA graph, so the result is
+cached per prompt: it is reused while the prompt is unchanged and regenerated when the client
+switches the prompt or resets the cache explicitly. New connections and the end of warmup clear
+the cache.
 
 Run It
 ------

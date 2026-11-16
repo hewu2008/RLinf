@@ -49,8 +49,6 @@ class Pi0Config:
     max_subtask_len: int = 20
     # 0.0 selects the argmax token (greedy), > 0.0 samples with logits / T.
     subtask_temperature: float = 0.0
-    # Regenerate the cached subtask after this many requests (serving only).
-    subtask_refresh_steps: int = 50
 
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:

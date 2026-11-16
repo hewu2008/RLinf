@@ -116,7 +116,6 @@ class Pi0Eval(EnvIO, Pi0):
         self._subtask_tokenizer: SubtaskPaligemmaTokenizer | None = None
         self._subtask_cache: str | None = None
         self._subtask_cache_prompt: str | None = None
-        self._subtask_requests = 0
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
             "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
@@ -158,7 +157,6 @@ class Pi0Eval(EnvIO, Pi0):
                 subtask = self.generate_subtask(observation, prompt)
                 self._subtask_cache = subtask
                 self._subtask_cache_prompt = prompt
-                self._subtask_requests = 0
             observation = self._with_subtask_tokens(observation, prompt, subtask)
             cond_observation = None
             if self.cfgrl_guidance_scale > 0.0:
@@ -344,7 +342,10 @@ class Pi0Eval(EnvIO, Pi0):
                 positions=step_positions,
                 mask=step_mask,
                 kv_cache=kv_cache,
-                return_prefix=False,
+                # The decode reads the prefix expert's output, so the last
+                # layer must keep its final FFN/norm (return_prefix=False
+                # drops expert 0 and returns None).
+                return_prefix=True,
             )
             hidden = step_outputs[0][:, -1]
             next_pos += 1
@@ -400,15 +401,16 @@ class Pi0Eval(EnvIO, Pi0):
         """Drop the cached subtask; call when a new episode starts."""
         self._subtask_cache = None
         self._subtask_cache_prompt = None
-        self._subtask_requests = 0
 
     def _cached_subtask(self, prompt: str) -> str | None:
-        """Return the cached subtask while the episode is unchanged."""
+        """Reuse the cached subtask while the prompt is unchanged.
+
+        Regeneration is event driven: a new prompt or an explicit
+        :meth:`reset_subtask_cache` invalidates the cache. Without such an
+        event the subtask stays fixed for the connection.
+        """
         if self._subtask_cache is None or prompt != self._subtask_cache_prompt:
             return None
-        if self._subtask_requests >= self.subtask_refresh_steps:
-            return None
-        self._subtask_requests += 1
         return self._subtask_cache
 
     def setup_transforms(

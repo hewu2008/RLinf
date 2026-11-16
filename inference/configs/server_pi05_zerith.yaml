@@ -54,13 +54,12 @@ openpi:
   rtc_guidance_clip: 5.0
   # pi0.5 subtask stage: generate the subtask text from the prefix and
   # condition the action branch on it. Requires a checkpoint trained with
-  # train_subtask_prediction. The subtask is cached for subtask_refresh_steps
-  # requests, so the autoregressive loop runs once per subtask segment rather
-  # than once per chunk (it cannot enter the CUDA graph).
+  # train_subtask_prediction. The generated subtask is cached until the prompt
+  # changes (or a new connection starts), so the autoregressive loop does not
+  # run per chunk; it cannot enter the CUDA graph.
   sample_subtask_prediction: false
   subtask_temperature: 0.0
   max_subtask_len: 20
-  subtask_refresh_steps: 50
   # Classifier-free guidance: every denoise step mixes the plain-prompt branch
   # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the
   # conditioned prompt appends "\nAdvantage: <guidance_type>" as in training.

@@ -40,4 +40,3 @@ openpi:
   subtask_loss_weight: 1.0
   max_subtask_len: 20
   subtask_temperature: 0.0
-  subtask_refresh_steps: 50

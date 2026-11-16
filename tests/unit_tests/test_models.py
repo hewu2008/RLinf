@@ -3639,6 +3639,14 @@ def test_subtask_advantage_follows_the_subtask_tokens():
     assert cond[1].sum() - plain[1].sum() == cond[2].sum() - plain[2].sum()
 
 
+def test_cached_subtask_only_invalidates_on_prompt_change():
+    model = SimpleNamespace(_subtask_cache="pick", _subtask_cache_prompt="task")
+    assert Pi0Eval._cached_subtask(model, "task") == "pick"
+    assert Pi0Eval._cached_subtask(model, "other") is None
+    model._subtask_cache = None
+    assert Pi0Eval._cached_subtask(model, "task") is None
+
+
 def test_subtask_lm_loss_only_scores_the_masked_tokens():
     fake_llm = SimpleNamespace(embedder=SimpleNamespace(decode=lambda x: x))
     model = SimpleNamespace(llm=fake_llm)

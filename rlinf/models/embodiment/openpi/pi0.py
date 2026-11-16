@@ -181,7 +181,6 @@ class Pi0(model.BaseModel):
         self.subtask_loss_weight = float(config.subtask_loss_weight)
         self.max_subtask_len = int(config.max_subtask_len)
         self.subtask_temperature = float(config.subtask_temperature)
-        self.subtask_refresh_steps = int(config.subtask_refresh_steps)
         # ``None`` keeps :func:`euler_denoise_loop`; Pi0Eval.enable_sampler_graph
         # swaps in a captured CUDA graph for eval serving.
         self._plain_denoise_fn = None
