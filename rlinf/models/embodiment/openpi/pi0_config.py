@@ -44,7 +44,7 @@ class Pi0Config:
     train_subtask_prediction: bool = False
     sample_subtask_prediction: bool = False
     # Weight of the subtask cross-entropy added to the flow-matching loss.
-    subtask_loss_weight: float = 1.0
+    subtask_loss_weight: float = 0.1
     # Slots reserved for the generated subtask; also caps the supervised length.
     max_subtask_len: int = 20
     # 0.0 selects the argmax token (greedy), > 0.0 samples with logits / T.

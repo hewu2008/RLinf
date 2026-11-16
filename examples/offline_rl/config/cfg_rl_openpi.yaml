@@ -69,7 +69,7 @@ actor:
       positive_only_conditional: true
       # Token-level subtask prediction (no classification head).
       train_subtask_prediction: true
-      subtask_loss_weight: 1.0
+      subtask_loss_weight: 0.1
       max_subtask_len: 24
 
   optim:

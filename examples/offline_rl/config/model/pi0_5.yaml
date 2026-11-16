@@ -37,7 +37,7 @@ openpi:
   # subtask_index column; the classification head is not implemented.
   train_subtask_prediction: False
   sample_subtask_prediction: False
-  subtask_loss_weight: 1.0
+  subtask_loss_weight: 0.1
   max_subtask_len: 24
   subtask_temperature: 0.0
   subtask_decode_graph: True

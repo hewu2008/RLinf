@@ -177,7 +177,7 @@ class OpenPi0Config(Pi0Config):
     # pi0.5 subtask prediction: a token-level cross-entropy on the subtask text.
     # The classification head is intentionally not implemented.
     train_subtask_prediction: bool = False
-    subtask_loss_weight: float = 1.0
+    subtask_loss_weight: float = 0.1
     max_subtask_len: int = 20
 
     def __post_init__(self):
