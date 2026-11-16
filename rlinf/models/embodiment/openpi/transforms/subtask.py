@@ -157,6 +157,7 @@ class SubtaskPaligemmaTokenizer:
         state: np.ndarray | None = None,
         *,
         max_subtask_len: int = 20,
+        advantage: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Tokenize a frame with its ground-truth subtask.
 
@@ -166,6 +167,10 @@ class SubtaskPaligemmaTokenizer:
             state: Normalized robot state; required when the state is part of
                 the language prompt (pi0.5).
             max_subtask_len: Cap on the supervised subtask length.
+            advantage: Optional advantage condition (``positive`` / ``negative``).
+                It is appended **after** the subtask, so the subtask tokens
+                cannot attend to it: the subtask depends on the task and state,
+                the action depends on the subtask and the advantage.
 
         Returns:
             ``(tokens, token_mask, ar_mask, loss_mask)`` padded to ``max_len``.
@@ -182,9 +187,14 @@ class SubtaskPaligemmaTokenizer:
         if subtask_tokens[-1] != PALIGEMMA_EOS_TOKEN:
             # A truncated subtask keeps an EOS so generation still learns to stop.
             subtask_tokens[-1] = PALIGEMMA_EOS_TOKEN
+        advantage_tokens: list[int] = []
+        if advantage:
+            advantage_tokens = self._tokenizer.encode(
+                f"\nAdvantage: {self._clean_text(advantage)};"
+            )
         cue_tokens = self._tokenizer.encode(SUBTASK_ACTION_CUE)
 
-        tokens = prefix_tokens + subtask_tokens + cue_tokens
+        tokens = prefix_tokens + subtask_tokens + advantage_tokens + cue_tokens
         if len(tokens) > self._max_len:
             raise ValueError(
                 f"Subtask prompt needs {len(tokens)} tokens but max_token_len is "
@@ -193,12 +203,12 @@ class SubtaskPaligemmaTokenizer:
             )
         token_mask = [True] * len(tokens)
         ar_mask = [0] * len(prefix_tokens) + [1] * (
-            len(subtask_tokens) + len(cue_tokens)
+            len(subtask_tokens) + len(advantage_tokens) + len(cue_tokens)
         )
         loss_mask = (
             [False] * len(prefix_tokens)
             + [True] * len(subtask_tokens)
-            + [False] * len(cue_tokens)
+            + [False] * (len(advantage_tokens) + len(cue_tokens))
         )
         return self._pad(tokens, token_mask, ar_mask, loss_mask)
 
@@ -464,16 +474,18 @@ class TokenizePi05SubtaskGuidanceInputs(DataTransformFn):
             prompt, subtask, state, max_subtask_len=self.max_subtask_len
         )
         positive = self.tokenizer.tokenize_subtask_training(
-            _prompt_text(prompt, "positive"),
+            prompt,
             subtask,
             state,
             max_subtask_len=self.max_subtask_len,
+            advantage="positive",
         )
         negative = self.tokenizer.tokenize_subtask_training(
-            _prompt_text(prompt, "negative"),
+            prompt,
             subtask,
             state,
             max_subtask_len=self.max_subtask_len,
+            advantage="negative",
         )
         tokens, token_mask, ar_mask, loss_mask = plain
         for name, variant in (("positive", positive), ("negative", negative)):

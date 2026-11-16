@@ -3626,6 +3626,19 @@ def test_subtask_guidance_inputs_keep_one_subtask_per_branch():
     assert int(out["token_loss_mask"].sum()) > 0
 
 
+def test_subtask_advantage_follows_the_subtask_tokens():
+    tokenizer = _subtask_tokenizer()
+    plain = tokenizer.tokenize_subtask_training("task", "pick", None, max_subtask_len=8)
+    cond = tokenizer.tokenize_subtask_training(
+        "task", "pick", None, max_subtask_len=8, advantage="positive"
+    )
+    # The advantage segment comes after the subtask, so the supervised positions
+    # are identical and only the trailing causal block grows.
+    assert np.array_equal(np.flatnonzero(plain[3]), np.flatnonzero(cond[3]))
+    assert cond[2].sum() > plain[2].sum()
+    assert cond[1].sum() - plain[1].sum() == cond[2].sum() - plain[2].sum()
+
+
 def test_subtask_lm_loss_only_scores_the_masked_tokens():
     fake_llm = SimpleNamespace(embedder=SimpleNamespace(decode=lambda x: x))
     model = SimpleNamespace(llm=fake_llm)
@@ -3720,3 +3733,8 @@ def test_with_subtask_tokens_swaps_the_prompt_layout():
     assert updated.token_ar_mask.shape == (1, 256)
     assert int(updated.token_ar_mask.sum()) > 0
     assert updated.token_loss_mask is None
+
+    cond = Pi0Eval._with_subtask_tokens(
+        model, observation, "task", "pick", advantage="positive"
+    )
+    assert int(cond.token_ar_mask.sum()) > int(updated.token_ar_mask.sum())

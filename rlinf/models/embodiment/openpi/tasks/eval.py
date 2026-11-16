@@ -160,13 +160,15 @@ class Pi0Eval(EnvIO, Pi0):
                 self._subtask_cache_prompt = prompt
                 self._subtask_requests = 0
             observation = self._with_subtask_tokens(observation, prompt, subtask)
-        cond_observation = self._guidance_observation(env_obs)
-        if cond_observation is not None and subtask and prompt is not None:
-            cond_observation = self._with_subtask_tokens(
-                cond_observation,
-                f"{prompt}\nAdvantage: {self.guidance_type}",
-                subtask,
-            )
+            cond_observation = None
+            if self.cfgrl_guidance_scale > 0.0:
+                # The advantage segment goes after the subtask, so the subtask
+                # tokens cannot attend to it; only the action branch sees it.
+                cond_observation = self._with_subtask_tokens(
+                    observation, prompt, subtask, advantage=self.guidance_type
+                )
+        else:
+            cond_observation = self._guidance_observation(env_obs)
         logger = get_logger()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -358,7 +360,11 @@ class Pi0Eval(EnvIO, Pi0):
         return subtask
 
     def _with_subtask_tokens(
-        self, observation: Observation, prompt: str, subtask: str
+        self,
+        observation: Observation,
+        prompt: str,
+        subtask: str,
+        advantage: str | None = None,
     ) -> Observation:
         """Replace the plain prompt with the subtask-conditioned training layout."""
         if self._subtask_tokenizer is None:
@@ -368,7 +374,11 @@ class Pi0Eval(EnvIO, Pi0):
         state = observation.state[0].detach().to(torch.float32).cpu().numpy()
         tokens, token_mask, ar_mask, _ = (
             self._subtask_tokenizer.tokenize_subtask_training(
-                prompt, subtask, state, max_subtask_len=self.max_subtask_len
+                prompt,
+                subtask,
+                state,
+                max_subtask_len=self.max_subtask_len,
+                advantage=advantage,
             )
         )
         device = observation.state.device

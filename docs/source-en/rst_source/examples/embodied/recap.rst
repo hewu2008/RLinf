@@ -688,6 +688,9 @@ only; there is **no classification head**.
 - the prompt layout is ``Task: <task>, State: <state>;\nSubtask: <subtask>;\nAction: ``;
 - only the subtask tokens (including their EOS) carry the cross-entropy; the rest is prefix;
 - subtask tokens attend causally while the prefix stays bidirectional;
+- the CFG advantage segment sits after ``Subtask:`` and before ``Action:``, so the subtask tokens
+  cannot attend to it: the subtask depends on the task and state, the action on the subtask and the
+  advantage;
 - the subtask label is an input condition and is orthogonal to the advantage routing used by CFG.
 
 **Configuration**

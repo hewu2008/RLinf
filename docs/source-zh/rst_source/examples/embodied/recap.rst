@@ -676,7 +676,9 @@ Subtask 预测训练（可选）
 - prompt 布局为 ``Task: <task>, State: <state>;\nSubtask: <subtask>;\nAction: ``；
 - 只有子任务 token（含 EOS）计入交叉熵，其余 prefix token 仅参与注意力；
 - 子任务 token 采用因果注意力，prefix 保持双向注意力；
-- 设备上的子任务标签只作为条件输入，与 advantage 的正负路由相互独立。
+- CFG 的 advantage 段位于 ``Subtask:`` 之后、``Action:`` 之前，子任务 token 看不到 advantage：
+  子任务由任务与状态决定，动作再由子任务与 advantage 共同决定；
+- 子任务标签只作为条件输入，与 advantage 的正负路由相互独立。
 
 **配置**
 
