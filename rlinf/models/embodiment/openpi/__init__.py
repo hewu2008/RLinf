@@ -129,6 +129,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         value = OmegaConf.select(model_cfg, key, default=None)
         if value is not None:
             pi0_kwargs[key] = bool(value)
+    value = OmegaConf.select(model_cfg, "subtask_decode_graph", default=None)
+    if value is not None:
+        pi0_kwargs["subtask_decode_graph"] = bool(value)
     for key, cast in (("subtask_loss_weight", float), ("max_subtask_len", int)):
         value = OmegaConf.select(model_cfg, key, default=None)
         if value is not None:

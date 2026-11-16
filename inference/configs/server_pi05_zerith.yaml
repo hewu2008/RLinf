@@ -60,6 +60,9 @@ openpi:
   sample_subtask_prediction: false
   subtask_temperature: 0.0
   max_subtask_len: 20
+  # Replay each decode step from a captured CUDA graph (falls back to eager
+  # without CUDA). Measured 15 ms -> 6 ms per token on the 2B model.
+  subtask_decode_graph: true
   # Classifier-free guidance: every denoise step mixes the plain-prompt branch
   # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the
   # conditioned prompt appends "\nAdvantage: <guidance_type>" as in training.

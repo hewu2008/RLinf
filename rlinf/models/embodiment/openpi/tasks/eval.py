@@ -112,8 +112,13 @@ class Pi0Eval(EnvIO, Pi0):
         self._rtc_action_anchor = None
         self._rtc_anchor_mismatch_logged = False
         # Subtask generation state: the tokenizer is installed with the input
-        # pipeline.
+        # pipeline, and each decode step gets its own captured graph keyed by
+        # the prefix length.
         self._subtask_tokenizer: SubtaskPaligemmaTokenizer | None = None
+        self._subtask_decode_graphs: dict[int, Any] = {}
+        # (prefix_mask, kv_cache, prefix_len) of the current request, reused by
+        # the action branch so the image/task prefix is encoded once.
+        self._last_subtask_prefix = None
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
             "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
@@ -148,19 +153,33 @@ class Pi0Eval(EnvIO, Pi0):
         observation = self.env_obs_to_observation(env_obs)
         subtask = None
         prompt = None
+        plain_prefix = None
+        cond_prefix = None
         if self.sample_subtask_prediction:
             prompt = self._prompt_from_env_obs(env_obs)
             # Regenerate from the current observation on every request: the
             # subtask depends on what the cameras see, which changes per frame.
             subtask = self.generate_subtask(observation, prompt)
-            observation = self._with_subtask_tokens(observation, prompt, subtask)
-            cond_observation = None
-            if self.cfgrl_guidance_scale > 0.0:
-                # The advantage segment goes after the subtask, so the subtask
-                # tokens cannot attend to it; only the action branch sees it.
-                cond_observation = self._with_subtask_tokens(
-                    observation, prompt, subtask, advantage=self.guidance_type
+            plain_prefix = self._subtask_prefix_cache(observation, prompt, subtask)
+            if plain_prefix is None:
+                observation = self._with_subtask_tokens(observation, prompt, subtask)
+                cond_observation = (
+                    self._with_subtask_tokens(
+                        observation, prompt, subtask, advantage=self.guidance_type
+                    )
+                    if self.cfgrl_guidance_scale > 0.0
+                    else None
                 )
+            else:
+                cond_observation = None
+                if self.cfgrl_guidance_scale > 0.0:
+                    # The advantage segment goes after the subtask, so the
+                    # subtask tokens cannot attend to it; only the action branch
+                    # sees it, and the prefix cache already encodes that split.
+                    cond_prefix = self._subtask_prefix_cache(
+                        observation, prompt, subtask, advantage=self.guidance_type
+                    )
+                    cond_observation = observation
         else:
             cond_observation = self._guidance_observation(env_obs)
         logger = get_logger()
@@ -184,6 +203,8 @@ class Pi0Eval(EnvIO, Pi0):
                 cond_observation=cond_observation,
                 noise=noise,
                 rng=rng,
+                prefix=plain_prefix,
+                cond_prefix=cond_prefix,
             )
         else:
             actions, result = self._predict_eval(
@@ -192,6 +213,8 @@ class Pi0Eval(EnvIO, Pi0):
                 rng=rng,
                 cond_observation=cond_observation,
                 cfg_scale=self.cfgrl_guidance_scale,
+                prefix=plain_prefix,
+                cond_prefix=cond_prefix,
             )
         if subtask is not None:
             result["subtask"] = subtask
@@ -304,18 +327,85 @@ class Pi0Eval(EnvIO, Pi0):
         state = observation.state[0].detach().to(torch.float32).cpu().numpy()
         prefix_tokens = self._subtask_tokenizer.encode_subtask_prefix(prompt, state)
         device = observation.state.device
-        tokens = torch.tensor([prefix_tokens], dtype=torch.long, device=device)
-        token_mask = torch.ones_like(tokens, dtype=torch.bool)
-        positions = torch.arange(tokens.shape[1], device=device)[None, :]
-        prefix_attn_mask = make_attn_mask(token_mask, torch.zeros_like(token_mask))
+        # Pad the prefix to a fixed budget so the per-step decode graphs do not
+        # depend on the digit count of the discretized state.
+        valid_len = len(prefix_tokens)
+        budget = max(valid_len, self.max_token_len - self.max_subtask_len - 8)
+        tokens = torch.zeros((1, budget), dtype=torch.long, device=device)
+        tokens[0, :valid_len] = torch.tensor(
+            prefix_tokens, dtype=torch.long, device=device
+        )
+        token_mask = torch.zeros((1, budget), dtype=torch.bool, device=device)
+        token_mask[0, :valid_len] = True
+        # The subtask depends on the camera views: reuse the full prefix
+        # embedding (images + language) instead of the language tokens alone.
+        prepared = preprocess_observation(observation, train=False)
+        prefix_obs = Observation(
+            images=prepared.images,
+            image_masks=prepared.image_masks,
+            state=prepared.state,
+            tokenized_prompt=tokens,
+            tokenized_prompt_mask=token_mask,
+            token_ar_mask=torch.zeros_like(token_mask),
+            token_loss_mask=None,
+            pcd_xyz=getattr(prepared, "pcd_xyz", None),
+        )
+        prefix_tokens_emb, prefix_mask, prefix_ar_mask = self.embed_prefix(prefix_obs)
+        image_len = prefix_tokens_emb.shape[1] - tokens.shape[1]
+        positions = torch.cumsum(prefix_mask.int(), dim=1) - 1
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         outputs, kv_cache = self.llm(
-            [self.llm.embed(tokens), None],
+            [prefix_tokens_emb, None],
             positions=positions,
             mask=prefix_attn_mask,
         )
-        hidden = outputs[0][:, -1]
+        logits = self.llm.embedder.decode(outputs[0][:, image_len + valid_len - 1])
+        self._last_subtask_prefix = (prefix_mask, kv_cache, valid_len, image_len)
 
-        next_pos = tokens.shape[1]
+        generated = self._graph_decode(image_len + budget, logits, kv_cache)
+        if generated is None:
+            generated = self._eager_decode(
+                outputs[0][:, image_len + valid_len - 1],
+                image_len + budget,
+                kv_cache,
+                device,
+            )
+
+        subtask = self._subtask_tokenizer.detokenize(
+            torch.cat(generated, dim=1)[0].cpu().numpy()
+        )
+        if not subtask:
+            get_logger().warning(
+                "Pi0Eval: subtask generation produced an empty string; the action "
+                "branch falls back to the plain prompt"
+            )
+        return subtask
+
+    def _graph_decode(self, prefix_len, logits, kv_cache):
+        """Decode with captured step graphs, or return None to fall back."""
+        if (
+            not self.subtask_decode_graph
+            or self.subtask_temperature > 0.0
+            or not torch.cuda.is_available()
+        ):
+            return None
+        from rlinf.models.embodiment.openpi.sampling.subtask_decode import (
+            SubtaskDecodeGraph,
+        )
+
+        graph = self._subtask_decode_graphs.get(prefix_len)
+        if graph is None:
+            graph = SubtaskDecodeGraph(
+                self, prefix_len=prefix_len, max_steps=self.max_subtask_len
+            )
+            self._subtask_decode_graphs[prefix_len] = graph
+        if not graph.available:
+            return None
+        generated = graph.generate(logits, kv_cache, eos_token=PALIGEMMA_EOS_TOKEN)
+        return generated or None
+
+    def _eager_decode(self, hidden, next_pos, kv_cache, device):
+        """Reference decode loop used when graphs are disabled or unavailable."""
         generated = []
         for _ in range(self.max_subtask_len):
             logits = self.llm.embedder.decode(hidden)
@@ -345,16 +435,51 @@ class Pi0Eval(EnvIO, Pi0):
             )
             hidden = step_outputs[0][:, -1]
             next_pos += 1
+        return generated
 
-        subtask = self._subtask_tokenizer.detokenize(
-            torch.cat(generated, dim=1)[0].cpu().numpy()
-        )
-        if not subtask:
-            get_logger().warning(
-                "Pi0Eval: subtask generation produced an empty string; the action "
-                "branch falls back to the plain prompt"
+    def _subtask_prefix_cache(
+        self,
+        observation: Observation,
+        prompt: str,
+        subtask: str,
+        advantage: str | None = None,
+    ):
+        """Extend the generation prefix cache with the action-branch tokens.
+
+        Returns ``(prefix_mask, kv_cache)`` for ``sample_actions``, or ``None``
+        when the generation prefix is unavailable.
+        """
+        if self._last_subtask_prefix is None or self._subtask_tokenizer is None:
+            return None
+        _, kv_cache, valid_len, image_len = self._last_subtask_prefix
+        state = observation.state[0].detach().to(torch.float32).cpu().numpy()
+        tokens, token_mask, ar_mask, _ = (
+            self._subtask_tokenizer.tokenize_subtask_training(
+                prompt,
+                subtask,
+                state,
+                max_subtask_len=self.max_subtask_len,
+                advantage=advantage,
             )
-        return subtask
+        )
+        device = observation.state.device
+        new_tokens = torch.as_tensor(
+            tokens[None, valid_len:], dtype=torch.long, device=device
+        )
+        new_mask = torch.as_tensor(
+            token_mask[None, valid_len:], dtype=torch.bool, device=device
+        )
+        new_ar = torch.as_tensor(
+            ar_mask[None, valid_len:], dtype=torch.bool, device=device
+        )
+        # The generation cache holds the image tokens followed by the padded
+        # language prefix; keep exactly those tokens and continue from there.
+        past_len = image_len + valid_len
+        past_cache = tuple((k[:, :past_len], v[:, :past_len]) for k, v in kv_cache)
+        _, full_mask, full_kv = self.extend_prefix_cache(
+            new_tokens, past_cache, past_len, new_mask, new_ar
+        )
+        return full_mask, full_kv
 
     def _with_subtask_tokens(
         self,
@@ -466,6 +591,8 @@ class Pi0Eval(EnvIO, Pi0):
         cond_observation,
         noise: torch.Tensor | None,
         rng: torch.Generator | None,
+        prefix=None,
+        cond_prefix=None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
             sample_actions_with_rtc_guidance,
@@ -485,6 +612,8 @@ class Pi0Eval(EnvIO, Pi0):
             guidance_mode=self.rtc_guidance_mode,
             guidance_steps=self.rtc_guidance_steps,
             denoise_fn=self._rtc_denoise_fn,
+            prefix=prefix,
+            cond_prefix=cond_prefix,
         )
         actions = self.decode_actions(model_actions, observation.state)
         B = actions.shape[0]

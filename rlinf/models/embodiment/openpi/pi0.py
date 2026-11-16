@@ -94,6 +94,8 @@ def euler_denoise_loop(
     observation,
     cond_observation,
     noise: torch.Tensor,
+    prefix=None,
+    cond_prefix=None,
     *,
     num_steps: int,
     cfg_scale: float,
@@ -123,12 +125,17 @@ def euler_denoise_loop(
     B = observation.state.shape[0]
     device = observation.state.device
 
-    _, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
+    _, prefix_mask, kv_cache = (
+        pi0_model.build_prefix_cache(observation) if prefix is None else (None, *prefix)
+    )
     branches = 1
     if cond_observation is not None:
-        _, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
-            cond_observation
-        )
+        if cond_prefix is None:
+            _, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
+                cond_observation
+            )
+        else:
+            cond_prefix_mask, cond_kv_cache = cond_prefix
         observation, prefix_mask, kv_cache = stack_cfg_branches(
             observation,
             cond_observation,
@@ -181,6 +188,7 @@ class Pi0(model.BaseModel):
         self.subtask_loss_weight = float(config.subtask_loss_weight)
         self.max_subtask_len = int(config.max_subtask_len)
         self.subtask_temperature = float(config.subtask_temperature)
+        self.subtask_decode_graph = bool(config.subtask_decode_graph)
         # ``None`` keeps :func:`euler_denoise_loop`; Pi0Eval.enable_sampler_graph
         # swaps in a captured CUDA graph for eval serving.
         self._plain_denoise_fn = None
@@ -630,6 +638,53 @@ class Pi0(model.BaseModel):
         )
         return outputs[0], prefix_mask, kv_cache
 
+    def extend_prefix_cache(
+        self,
+        token_ids: torch.Tensor,
+        past_cache: tuple,
+        past_len: int,
+        token_mask: torch.Tensor,
+        token_ar_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple]:
+        """Forward new language tokens on top of an existing prefix cache.
+
+        The subtask stage already paid for the image and task prefix; the action
+        branch reuses that KV cache and only encodes the subtask text, the
+        advantage segment and the action cue.
+
+        Args:
+            token_ids: (B, T) new token ids.
+            past_cache: KV cache covering the first ``past_len`` tokens.
+            past_len: Number of tokens already cached.
+            token_mask: (B, T) valid-token mask of the new tokens.
+            token_ar_mask: (B, T) causal mask of the new tokens (1 = new block).
+
+        Returns:
+            outputs: (B, T, width) hidden states of the new tokens.
+            full_mask: (B, past_len + T) mask of the whole prefix.
+            kv_cache: KV cache covering all ``past_len + T`` tokens.
+        """
+        B, T = token_ids.shape
+        device = token_ids.device
+        past_mask = torch.ones((B, past_len), dtype=torch.bool, device=device)
+        full_mask = torch.cat([past_mask, token_mask.to(torch.bool)], dim=1)
+        full_ar = torch.cat(
+            [
+                torch.zeros((B, past_len), dtype=torch.bool, device=device),
+                token_ar_mask.to(torch.bool),
+            ],
+            dim=1,
+        )
+        attn_mask = make_attn_mask(full_mask, full_ar)[:, -T:, :]
+        positions = past_len + torch.cumsum(token_mask.int(), dim=1) - 1
+        outputs, kv_cache = self.llm(
+            [self.llm.embed(token_ids), None],
+            positions=positions,
+            mask=attn_mask,
+            kv_cache=past_cache,
+        )
+        return outputs[0], full_mask, kv_cache
+
     def run_suffix(
         self,
         observation: model.Observation,
@@ -725,6 +780,8 @@ class Pi0(model.BaseModel):
         rng: torch.Generator | None = None,
         cond_observation: model.Observation | None = None,
         cfg_scale: float = 0.0,
+        prefix=None,
+        cond_prefix=None,
     ) -> torch.Tensor:
         """Sample actions using Euler ODE solver.
 
@@ -767,6 +824,8 @@ class Pi0(model.BaseModel):
             observation,
             cond_observation,
             noise,
+            prefix,
+            cond_prefix,
             num_steps=num_steps,
             cfg_scale=cfg_scale,
         )

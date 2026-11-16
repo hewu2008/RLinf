@@ -727,10 +727,14 @@ CFG guidance are unchanged). Server configuration:
      subtask_temperature: 0.0       # 0.0 is greedy decoding
      max_subtask_len: 20
 
-Subtask generation is a dynamic-length loop that cannot enter a CUDA graph and depends on the
-current observation, so it is regenerated on every request. One generation takes about 200-330 ms
-(depending on ``max_subtask_len`` and whether EOS comes early), roughly ten control periods at
-30 Hz; keep ``max_subtask_len`` at 12-16 and leave enough RTC execution horizon.
+Subtask generation depends on the current observation and is regenerated on every request. The
+full loop cannot enter a CUDA graph, but each decode step can (`subtask_decode_graph`): about
+15 ms down to 6 ms per token, so a 20-step generation (including the image prefix) takes about
+155 ms. The action branch reuses the generation prefix KV cache and only encodes the subtask text
+and the action cue, taking about 135 ms; end to end is therefore about 291 ms at the 20-step
+bound, and about 230 ms for a typical 12-step subtask. Reusing the prefix splits one long prefix
+attention into two passes, which differs from a full rebuild by about 1.8e-2 in bf16 actions;
+disable prefix reuse when bit-exact replay is required.
 
 Run It
 ------

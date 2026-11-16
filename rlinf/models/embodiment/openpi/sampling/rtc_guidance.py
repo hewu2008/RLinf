@@ -249,6 +249,8 @@ def rtc_denoise_loop(
     noise: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    prefix=None,
+    cond_prefix=None,
     *,
     num_steps: int,
     guidance_clip: float,
@@ -306,14 +308,20 @@ def rtc_denoise_loop(
     B = observation.state.shape[0]
     device = observation.state.device
 
-    prefix_out, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
-    del prefix_out
+    if prefix is None:
+        prefix_out, prefix_mask, kv_cache = pi0_model.build_prefix_cache(observation)
+        del prefix_out
+    else:
+        prefix_mask, kv_cache = prefix
     branches = 1
     if cond_observation is not None:
-        cond_prefix_out, cond_prefix_mask, cond_kv_cache = pi0_model.build_prefix_cache(
-            cond_observation
-        )
-        del cond_prefix_out
+        if cond_prefix is None:
+            cond_prefix_out, cond_prefix_mask, cond_kv_cache = (
+                pi0_model.build_prefix_cache(cond_observation)
+            )
+            del cond_prefix_out
+        else:
+            cond_prefix_mask, cond_kv_cache = cond_prefix
         observation, prefix_mask, kv_cache = stack_cfg_branches(
             observation,
             cond_observation,
@@ -585,6 +593,8 @@ def sample_actions_with_rtc_guidance(
     guidance_mode: str = "approx",
     guidance_steps: int | None = None,
     denoise_fn=None,
+    prefix=None,
+    cond_prefix=None,
 ) -> torch.Tensor:
     """Euler ODE sampling with overlap guidance against the previous chunk.
 
@@ -651,6 +661,8 @@ def sample_actions_with_rtc_guidance(
         noise,
         target,
         mask,
+        prefix,
+        cond_prefix,
         num_steps=num_steps,
         guidance_clip=guidance_clip,
         cfg_scale=cfg_scale,

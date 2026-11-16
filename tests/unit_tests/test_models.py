@@ -3706,15 +3706,40 @@ class _FakeGenLLM:
         return [hidden, None], ("kv",)
 
 
-def test_generate_subtask_stops_at_eos():
+def test_generate_subtask_stops_at_eos(monkeypatch):
+    monkeypatch.setattr(
+        "rlinf.models.embodiment.openpi.tasks.eval.preprocess_observation",
+        lambda obs, train: obs,
+    )
     fake_llm = _FakeGenLLM()
     model = SimpleNamespace(
         llm=fake_llm,
         _subtask_tokenizer=_subtask_tokenizer(),
         max_subtask_len=4,
+        max_token_len=200,
         subtask_temperature=0.0,
+        subtask_decode_graph=False,
     )
-    observation = SimpleNamespace(state=torch.zeros(1, 32))
+
+    def fake_embed_prefix(obs):
+        length = 2 + obs.tokenized_prompt.shape[1]
+        return (
+            torch.zeros(1, length, 4),
+            torch.ones(1, length, dtype=torch.bool),
+            torch.zeros(1, length, dtype=torch.bool),
+        )
+
+    model.embed_prefix = fake_embed_prefix
+    model._graph_decode = lambda *args, **kwargs: None
+    model._eager_decode = lambda hidden, next_pos, kv_cache, device: (
+        Pi0Eval._eager_decode(model, hidden, next_pos, kv_cache, device)
+    )
+    observation = SimpleNamespace(
+        state=torch.zeros(1, 32),
+        images={},
+        image_masks={},
+        pcd_xyz=None,
+    )
     text = Pi0Eval.generate_subtask(model, observation, "task")
     assert text == ""
     assert fake_llm.calls == 1

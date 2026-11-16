@@ -49,6 +49,9 @@ class Pi0Config:
     max_subtask_len: int = 20
     # 0.0 selects the argmax token (greedy), > 0.0 samples with logits / T.
     subtask_temperature: float = 0.0
+    # Replay each decode step from a captured CUDA graph (falls back to eager
+    # when CUDA or capture is unavailable).
+    subtask_decode_graph: bool = True
 
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:
