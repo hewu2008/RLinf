@@ -181,8 +181,10 @@ class Pi0Eval(EnvIO, Pi0):
         a different sequence of kernels. Shapes are pinned by the model config
         and the camera layout, so changing ``max_token_len``,
         ``num_action_chunks``, ``num_steps`` or the camera resolution
-        re-captures. Capture happens on the first call of each path, which the
-        server warmup covers.
+        re-captures; scalar guidance arguments such as ``rtc_guidance_mode``,
+        ``rtc_guidance_steps`` and ``rtc_guidance_clip`` are folded into the
+        captured kernels, so changing one re-captures as well. Capture happens
+        on the first call of each path, which the server warmup covers.
 
         ``rtc_guidance_mode="exact"`` is captured too: a graph records the
         backward kernels of every guided step, and the replay was measured

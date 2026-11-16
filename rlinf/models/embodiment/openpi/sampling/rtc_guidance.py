@@ -44,6 +44,7 @@ import torch
 
 from rlinf.models.embodiment.openpi.modules.model import preprocess_observation
 from rlinf.models.embodiment.openpi.sampling import rl_sampler
+from rlinf.utils.logging import get_logger
 
 
 @dataclass
@@ -479,6 +480,25 @@ def _copy_tensors_into(dst, src) -> bool:
     return False
 
 
+def _capture_key(kwargs: dict) -> tuple:
+    """Identify the scalar keyword arguments folded into a captured graph.
+
+    A graph embeds these values in its kernels, so a call that changes one has
+    to recapture. Only scalars are accepted: any other object cannot be compared
+    by value, and replaying recorded kernels against a different one would be
+    silently wrong.
+    """
+    key = []
+    for name, value in kwargs.items():
+        if not isinstance(value, (bool, int, float, str, type(None))):
+            raise TypeError(
+                "LoopGraphSampler captures scalar keyword arguments only; "
+                f"got {name}={value!r} ({type(value).__name__})"
+            )
+        key.append((name, value))
+    return tuple(key)
+
+
 class LoopGraphSampler:
     """Serve a denoise loop from one captured CUDA graph.
 
@@ -495,13 +515,14 @@ class LoopGraphSampler:
     the arithmetic (measured up to 1.7e-2 absolute drift on a 50-step chunk),
     so it cannot serve a deployment that requires the eager numbers.
 
-    The shapes are pinned by the model config and the camera layout. A call
-    whose tensors differ from the captured ones re-captures, and the capture
-    must run on CUDA.
+    The shapes are pinned by the model config and the camera layout, and the
+    keyword arguments (``guidance_mode``, ``guidance_steps``, ``guidance_clip``,
+    ``cfg_scale``, ``num_steps``) are folded into the recorded kernels. A call
+    whose tensors or scalars differ from the captured ones re-captures, and the
+    capture must run on CUDA.
 
     Any ``*args`` are the loop's tensor arguments; they are passed straight to
-    ``denoise_fn`` after the model, and keyword arguments are fixed at capture
-    time (they are Python scalars such as ``num_steps``).
+    ``denoise_fn`` after the model.
     """
 
     def __init__(self, denoise_fn) -> None:
@@ -510,16 +531,28 @@ class LoopGraphSampler:
         self._buffers = None
         self._output = None
         self._kwargs = None
+        self._key = None
 
     def __call__(self, pi0_model, *inputs, **kwargs) -> torch.Tensor:
-        if self._buffers is None or not _copy_tensors_into(self._buffers, inputs):
-            self._capture(pi0_model, inputs, kwargs)
+        key = _capture_key(kwargs)
+        if (
+            self._buffers is None
+            or key != self._key
+            or not _copy_tensors_into(self._buffers, inputs)
+        ):
+            self._capture(pi0_model, inputs, kwargs, key)
         self._graph.replay()
         return self._output.clone()
 
-    def _capture(self, pi0_model, inputs: tuple, kwargs: dict) -> None:
+    def _capture(self, pi0_model, inputs: tuple, kwargs: dict, key: tuple) -> None:
         self._kwargs = dict(kwargs)
+        self._key = key
         self._buffers = tuple(_clone_tensors(item) for item in inputs)
+        get_logger().info(
+            "LoopGraphSampler: captured %s with %s",
+            getattr(self._denoise_fn, "__name__", type(self._denoise_fn).__name__),
+            sorted(self._kwargs.items()),
+        )
         run = functools.partial(
             self._denoise_fn, pi0_model, *self._buffers, **self._kwargs
         )
@@ -563,7 +596,8 @@ def sample_actions_with_rtc_guidance(
 
     ``denoise_fn`` replaces :func:`rtc_denoise_loop`, which is how a caller
     serves a compiled loop; it receives the same positional arguments and the
-    same keyword arguments.
+    same keyword arguments. It is ignored when the request has no leftover to
+    guide towards, because that request is a plain Euler sample.
     """
     observation = preprocess_observation(observation, train=False)
     if cond_observation is not None:
@@ -597,9 +631,13 @@ def sample_actions_with_rtc_guidance(
         dtype=noise.dtype,
     )
     if prev_remaining is None:
-        # First chunk of an episode: the overlap term is zero, so the exact
-        # backward passes would only reproduce the plain Euler loop.
+        # No overlap term: the guided loop reduces to the plain Euler loop, and
+        # the exact backward passes would only reproduce it. Run this request
+        # eagerly so a captured graph is only ever built for the mode and step
+        # count a real replan uses; a graph built here would serve later replans
+        # with the wrong kernel sequence.
         guidance_mode = "approx"
+        denoise_fn = None
 
     run_denoise = rtc_denoise_loop if denoise_fn is None else denoise_fn
     return run_denoise(

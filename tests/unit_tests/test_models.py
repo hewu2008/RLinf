@@ -2011,6 +2011,89 @@ def _device_observation(branch: float, device: torch.device) -> Observation:
     )
 
 
+def _install_fake_cuda_graph(monkeypatch):
+    """Serve a LoopGraphSampler on CPU by faking the capture API."""
+    import contextlib
+
+    replays = []
+
+    class _FakeGraph:
+        def replay(self):
+            replays.append(1)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeGraph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph: contextlib.nullcontext())
+    return replays
+
+
+def test_loop_graph_sampler_recaptures_when_a_scalar_changes(monkeypatch):
+    """A scalar folded into the kernels must force a new capture."""
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        LoopGraphSampler,
+    )
+
+    replays = _install_fake_cuda_graph(monkeypatch)
+    runs = []
+
+    def denoise(model, x, *, scale):
+        del model
+        runs.append(scale)
+        return x * scale
+
+    sampler = LoopGraphSampler(denoise)
+    x = torch.ones(1, 1)
+    first = sampler(None, x, scale=1.0)
+    same = sampler(None, x, scale=1.0)
+    changed = sampler(None, x, scale=2.0)
+
+    # A capture warms the kernels twice and records once; a replay adds none.
+    assert runs == [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+    assert len(replays) == 3
+    assert torch.equal(first, torch.ones(1, 1))
+    assert torch.equal(same, torch.ones(1, 1))
+    assert torch.equal(changed, torch.full((1, 1), 2.0))
+
+
+def test_loop_graph_sampler_rejects_non_scalar_arguments():
+    """An argument the sampler cannot compare must fail instead of replaying."""
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        LoopGraphSampler,
+    )
+
+    def denoise(model, x, *, scale):
+        del model
+        return x * scale
+
+    sampler = LoopGraphSampler(denoise)
+
+    with pytest.raises(TypeError, match="scalar keyword arguments only"):
+        sampler(None, torch.ones(1, 1), scale=torch.ones(1))
+
+
+def test_rtc_sampling_without_a_leftover_skips_the_captured_loop():
+    """A request with no overlap runs eagerly, so it cannot seed the graph."""
+    model = _BranchedVelocityPi0()
+    calls = []
+
+    def captured(*args, **kwargs):
+        calls.append(1)
+        raise AssertionError("a request with no leftover must not replay the graph")
+
+    actions = sample_actions_with_rtc_guidance(
+        model,
+        _cfg_observation(0.0),
+        RTCGuidanceContext(),
+        num_steps=2,
+        noise=torch.zeros(1, model.action_horizon, model.action_dim),
+        guidance_mode="exact",
+        denoise_fn=captured,
+    )
+
+    assert calls == []
+    assert actions.shape == (1, model.action_horizon, model.action_dim)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_loop_graph_sampler_matches_the_eager_loop():
     from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
@@ -2048,6 +2131,44 @@ def test_loop_graph_sampler_matches_the_eager_loop():
     assert torch.equal(captured, eager)
     assert torch.equal(replayed, eager)
     assert replayed.data_ptr() != captured.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_loop_graph_sampler_recaptures_a_changed_scalar():
+    """A graph folds ``guidance_clip`` in, so a new value must recapture."""
+    from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
+        LoopGraphSampler,
+    )
+
+    device = torch.device("cuda")
+    model = _TensorVelocityPi0()
+    plain = _device_observation(0.0, device)
+    timesteps = rl_sampler.get_timesteps(4, device)
+    noise = torch.zeros(1, model.action_horizon, model.action_dim, device=device)
+    target = torch.ones(1, model.action_horizon, model.action_dim, device=device)
+    mask = torch.ones(1, model.action_horizon, 1, device=device)
+
+    def sample(denoise_fn, clip):
+        return denoise_fn(
+            model,
+            plain,
+            None,
+            timesteps,
+            noise,
+            target,
+            mask,
+            num_steps=4,
+            guidance_clip=clip,
+            cfg_scale=0.0,
+        )
+
+    eager_low = sample(rtc_denoise_loop, 1.0)
+    eager_high = sample(rtc_denoise_loop, 4.0)
+    assert not torch.equal(eager_low, eager_high)
+
+    graph_sampler = LoopGraphSampler(rtc_denoise_loop)
+    assert torch.equal(sample(graph_sampler, 1.0), eager_low)
+    assert torch.equal(sample(graph_sampler, 4.0), eager_high)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
