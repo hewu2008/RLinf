@@ -19,8 +19,8 @@ set -euo pipefail
 
 # Defaults follow the CFG-RL run currently deployed; edit these two paths when
 # merging another run.
-DEFAULT_CKPT="logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/cfg_sft/checkpoints/global_step_30000/actor/model_state_dict/full_weights.pt"
-DEFAULT_OUT="logs/cfg_rl/cfg_rl_openpi-20261110-19:07:16/deploy/global_step_30000_openpi"
+DEFAULT_CKPT="logs/cfg_rl/cfg_rl_openpi-20261116-18:47:43/cfg_sft/checkpoints/global_step_6000/actor/model_state_dict/full_weights.pt"
+DEFAULT_OUT="logs/cfg_rl/cfg_rl_openpi-20261116-18:47:43/deploy/global_step_6000_openpi"
 
 CKPT=${CKPT:-${1:-${DEFAULT_CKPT}}}
 BASE_MODEL=${BASE_MODEL:-${2:-/data/4T-1/hewu/model_zoo/pi05-pytorch-base}}
