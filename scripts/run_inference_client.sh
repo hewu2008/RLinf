@@ -70,8 +70,9 @@ ${launcher} "${PYTHON}" -m inference.client.main \
   --init_hdf5 /data/zerith_data/1_clear_the_bin_box_20261027/073230fe3e9b4f66bed95e2082a3a1e3/episode.hdf5 \
   --init_frame_idx 30 \
   --control_freq 30 \
-  --min_exec_horizon 18 \
-  --delay_buffer_size 10 \
+  --min_exec_horizon 20 \
+  --initial_delay_steps 15 \
+  --delay_buffer_size 20 \
   --num_steps 864000 \
   --save_dir rollouts \
   --task_name clear_the_bin_box \
