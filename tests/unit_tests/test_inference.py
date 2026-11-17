@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 import pytest
 
 from inference import protocol
+from inference.client.async_infer import InferenceWorker
 from inference.client.episode_recorder import (
     EpisodeRecorder,
     merge_joint_batch,
@@ -33,6 +35,42 @@ from inference.client.rtc_scheduler import RTCScheduler
 from inference.client.temporal_ensemble import TemporalEnsembleScheduler
 
 ACTION_DIM = 23
+
+
+def test_inference_worker_keeps_the_subtask_of_the_latest_response():
+    """The worker must surface the subtask the server sends beside the actions."""
+
+    class _Client:
+        def __init__(self):
+            self.responses = [
+                {
+                    "actions": _chunk(4),
+                    "subtask": "place the silver pipe in the front bin;",
+                },
+                {"actions": _chunk(4)},
+            ]
+
+        def infer(self, observation):
+            return self.responses.pop(0)
+
+    def wait_for_result(worker, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while worker.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    worker = InferenceWorker(_Client())
+    worker.start()
+    try:
+        worker.submit({}, 0)
+        wait_for_result(worker)
+        assert worker.last_subtask() == "place the silver pipe in the front bin;"
+
+        worker.submit({}, 1)
+        wait_for_result(worker)
+        # A server that does not serve subtask prediction sends no field at all.
+        assert worker.last_subtask() is None
+    finally:
+        worker.stop()
 
 
 class _FakeWorker:

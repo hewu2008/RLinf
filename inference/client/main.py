@@ -449,6 +449,7 @@ def main(argv: list[str] | None = None) -> None:
         worker.drain()
         scheduler.reset()
         gripper.reset()
+        subtask_state.update(norm=None)
         episode["index"] += 1
         episode["steps"] = 0
         if not start_episode():
@@ -456,6 +457,22 @@ def main(argv: list[str] | None = None) -> None:
                 f"no action chunk for episode {episode['index']} after "
                 f"{args.first_chunk_timeout:.0f}s; check the server logs"
             )
+
+    # The subtask is regenerated on every request, so only its text decides a
+    # change: casing and the trailing ";" are normalized away, and any other
+    # difference is logged on the step it first shows up.
+    subtask_state = {"norm": None}
+
+    def log_subtask(step: int) -> None:
+        """Log the generated subtask when it changes."""
+        raw = worker.last_subtask()
+        if not raw:
+            return
+        norm = raw.strip().rstrip(";").lower()
+        if norm == subtask_state["norm"]:
+            return
+        subtask_state["norm"] = norm
+        logger.info("step %d: subtask -> %s", step, raw)
 
     def control_step(step: int) -> bool:
         observation = env.get_observation()
@@ -484,6 +501,8 @@ def main(argv: list[str] | None = None) -> None:
             result_age = worker.last_result_age()
             if result_age is not None and result_age > args.watchdog_timeout:
                 logger.error("inference stalled for %.1fs", result_age)
+
+        log_subtask(step)
 
         episode["steps"] += 1
         if keys.poll() == "r":

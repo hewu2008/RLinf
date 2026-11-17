@@ -47,6 +47,9 @@ class InferenceWorker(threading.Thread):
         self._consecutive_failures = 0
         self._infer_times = []
         self._max_infer_time = 0.0
+        # Subtask text of the latest response; the server only sends it when it
+        # serves subtask prediction, so it stays None otherwise.
+        self._last_subtask: str | None = None
 
     @property
     def in_flight(self) -> bool:
@@ -84,6 +87,15 @@ class InferenceWorker(threading.Thread):
             if self._last_result_time is None:
                 return None
             return time.monotonic() - self._last_result_time
+
+    def last_subtask(self) -> str | None:
+        """Subtask text of the latest successful response, or None.
+
+        The server regenerates the subtask for every request, so this is the
+        newest one rather than the one the executing chunk was built from.
+        """
+        with self._lock:
+            return self._last_subtask
 
     def wait_for_first_result(self, timeout: float) -> bool:
         """Block until the first response arrives, at most ``timeout`` seconds."""
@@ -145,6 +157,7 @@ class InferenceWorker(threading.Thread):
             self._consecutive_failures = 0
             with self._lock:
                 self._result = (query_t, actions)
+                self._last_subtask = response.get("subtask")
                 self._last_result_time = time.monotonic()
                 self._in_flight = False
                 self._infer_times.append(elapsed)
