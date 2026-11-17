@@ -247,13 +247,14 @@ class Pi0(model.BaseModel):
 
         # Optional subtask classification head: same shapes as the CFG-RL
         # training model so ``subtask_classifier.*`` weights transfer as-is.
+        # Its dtype follows the backbone in ``_apply_openpi_param_dtypes``.
         self.subtask_classifier: SubtaskClassifier | None = None
         if config.subtask_classification:
             self.subtask_classifier = SubtaskClassifier(
                 paligemma_config.width,
                 int(config.subtask_class_hidden_dim),
                 int(config.num_subtask_classes),
-            ).to(torch.float32)
+            )
 
         # Optional PointNet
         if config.pcd:
@@ -952,6 +953,7 @@ class Pi0(model.BaseModel):
             "time_mlp_out",
             "stem",  # fp32 patch embedding (OpenPI SiglipVisionEmbeddings)
             "head",  # bf16 multi-modal projector
+            "subtask_classifier",  # pi0.5 subtask classification head
         ]
 
     def _mark_fsdp_wrap_names(self) -> None:

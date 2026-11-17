@@ -55,8 +55,8 @@ class SubtaskClassifier(nn.Module):
         """Map ``(B, width)`` cue hidden states to ``(B, num_classes)`` logits.
 
         The input is cast to the parameter dtype first: the head is built in
-        fp32, but a ``model.to(bf16)`` on the host policy would otherwise make
-        the matmul dtypes disagree with the bf16 prefix states.
+        fp32 and moved onto the backbone precision (bf16) by the model factory,
+        so the caller's fp32 cue would otherwise disagree with the weights.
         """
         x = x.to(self.out.weight.dtype)
         return self.out(F.gelu(self.hidden(self.norm(x))))

@@ -280,6 +280,9 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             # --pi05 only--
             "time_mlp_in",
             "time_mlp_out",
+            # pi0.5 subtask classification head: its own flat param keeps the
+            # dtype-uniformity FSDP1 requires regardless of its neighbours.
+            "subtask_classifier",
         ]
 
     def __init__(
@@ -301,15 +304,15 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         if self.subtask_classification:
             import openpi.models.gemma as _gemma
 
-            # fp32 readout of the bf16 residual stream: the two layers are ~1M
-            # parameters against the 2B VLM, so the extra copy is free. The head
-            # shares the actor optimizer and lr; it is trained end to end with
-            # the backbone rather than through its own parameter group.
+            # The head shares the actor optimizer and lr; it is trained end to
+            # end with the backbone rather than through its own parameter group.
+            # ``get_model`` moves it onto the backbone precision after the
+            # mixed-precision conversion.
             self.subtask_classifier = SubtaskClassifier(
                 _gemma.get_config(config.paligemma_variant).width,
                 int(config.subtask_class_hidden_dim),
                 int(config.num_subtask_classes),
-            ).to(torch.float32)
+            )
         for name, module in self.named_modules():
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)

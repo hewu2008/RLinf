@@ -3628,6 +3628,34 @@ def test_subtask_classifier_maps_cue_to_logits():
         SubtaskClassifier(width=8, hidden_dim=4, num_classes=0)
 
 
+def test_subtask_classifier_follows_the_backbone_dtype():
+    """FSDP1 flattens one wrap unit into one dtype; the head must match it."""
+    from rlinf.models.embodiment.openpi import _apply_openpi_param_dtypes
+
+    class _HostPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.llm = torch.nn.Linear(2, 2, bias=False)
+            self.subtask_classifier = SubtaskClassifier(
+                width=2, hidden_dim=2, num_classes=3
+            )
+
+        def to_bfloat16_for_selected_params(self, precision):
+            dtype = torch.bfloat16 if precision == "bfloat16" else torch.float32
+            self.llm.to(dtype=dtype)
+
+    bf16_model = _HostPolicy()
+    _apply_openpi_param_dtypes(bf16_model, torch.bfloat16)
+    assert bf16_model.llm.weight.dtype == torch.bfloat16
+    assert bf16_model.subtask_classifier.out.weight.dtype == torch.bfloat16
+    # The head still accepts the fp32 cue the model reads out.
+    assert bf16_model.subtask_classifier(torch.randn(2, 2)).shape == (2, 3)
+
+    fp32_model = _HostPolicy()
+    _apply_openpi_param_dtypes(fp32_model, torch.float32)
+    assert fp32_model.subtask_classifier.out.weight.dtype == torch.float32
+
+
 def test_subtask_class_loss_ignores_unannotated_frames():
     logits = torch.tensor(
         [

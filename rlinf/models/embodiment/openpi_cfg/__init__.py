@@ -104,6 +104,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         _apply_vlm_lora(model, int(cfg.get("lora_rank") or 32))
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    if model.subtask_classifier is not None:
+        # FSDP1 flattens the parameters of one wrap unit into a single tensor
+        # and requires one dtype. The head is not a wrap unit of its own, so it
+        # has to follow the backbone precision it shares a unit with.
+        model.subtask_classifier.to(dtype=torch.bfloat16)
     data_config = actor_train_config.data.create(
         actor_train_config.assets_dirs, actor_model_config
     )

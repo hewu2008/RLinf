@@ -373,10 +373,20 @@ def _apply_openpi_param_dtypes(model, target_dtype) -> None:
 
     if target_dtype is None or target_dtype == torch.bfloat16:
         model.to_bfloat16_for_selected_params("bfloat16")
+        head_dtype = torch.bfloat16
     elif target_dtype == torch.float32:
         model.to_bfloat16_for_selected_params("float32")
+        head_dtype = torch.float32
     else:
         model.to(target_dtype)
+        head_dtype = target_dtype
+
+    # FSDP1 flattens the parameters of one wrap unit into a single tensor and
+    # requires one dtype. The subtask classification head is not a wrap unit of
+    # its own, so it follows the backbone it shares a unit with.
+    head = getattr(model, "subtask_classifier", None)
+    if head is not None:
+        head.to(dtype=head_dtype)
 
     sample_keys = (
         "img.stem.weight",
@@ -386,6 +396,7 @@ def _apply_openpi_param_dtypes(model, target_dtype) -> None:
         "action_out_proj.weight",
         "state_proj.weight",
         "value_head.mlp.0.weight",
+        "subtask_classifier.out.weight",
     )
     named = dict(model.named_parameters())
     parts = [f"{key}={named[key].dtype}" for key in sample_keys if key in named]
