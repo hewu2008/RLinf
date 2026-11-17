@@ -55,13 +55,15 @@ actor:
 
   model:
     precision: null
-    model_path: "/data/4T-1/hewu/model_zoo/pi05-pytorch-base"
+    # Merged ZERITH pi05_zerith_subtask_cls checkpoint (no LoRA keys left in it,
+    # subtask_classifier weights included); fresh adapters are injected on load.
+    model_path: "/data/4T-1/hewu/model_zoo/pi05_zerith_subtask_cls_rlinf"
     model_type: "cfg_model"
     add_value_head: False
     is_lora: true
     lora_rank: 32
     openpi_data:
-      norm_stats_path: "/data/4T-1/hewu/model_zoo/pi05-pytorch-base/zerith/norm_stats.json"
+      norm_stats_path: "/data/4T-1/hewu/model_zoo/pi05_zerith_subtask_cls_rlinf/zerith/norm_stats.json"
     openpi:
       config_name: "pi05_zerith"
       cfgrl_guidance_scale: 1.0
@@ -81,7 +83,9 @@ actor:
       subtask_class_loss_weight: 0.1
 
   optim:
-    lr: 1.0e-4
+    # Fine-tuning from a converged subtask_cls checkpoint: keep the peak an
+    # order of magnitude below the previous from-base run (1.0e-4).
+    lr: 1.0e-5
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-8
@@ -90,7 +94,7 @@ actor:
     lr_scheduler: "cosine"
     lr_warmup_steps: 1000
     total_training_steps: 30000
-    min_lr: 2.0e-6
+    min_lr: 1.0e-6
 
   fsdp_config:
     strategy: "fsdp"
