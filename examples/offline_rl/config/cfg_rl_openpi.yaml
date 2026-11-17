@@ -27,9 +27,9 @@ runner:
     logger_backends: ["tensorboard"]
 
   max_epochs: -1
-  max_steps: 30000
+  max_steps: 6000
   val_check_interval: -1
-  save_interval: 3000
+  save_interval: 1000
   log_interval: 1
 
 data:
@@ -83,18 +83,20 @@ actor:
       subtask_class_loss_weight: 0.1
 
   optim:
-    # Fine-tuning from a converged subtask_cls checkpoint: keep the peak an
-    # order of magnitude below the previous from-base run (1.0e-4).
-    lr: 1.0e-5
+    # Warm start from a converged subtask_cls checkpoint: action loss already sits
+    # near 6e-3, so a large peak only perturbs the head. 6000 steps over 98
+    # episodes keeps the horizon inside one epoch instead of repeating it twice.
+    lr: 2.0e-6
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-8
     weight_decay: 1.0e-10
     clip_grad: 1.0
     lr_scheduler: "cosine"
-    lr_warmup_steps: 1000
-    total_training_steps: 30000
-    min_lr: 1.0e-6
+    lr_warmup_steps: 200
+    # null: derived from runner max_steps/max_epochs by the FSDP SFT worker.
+    total_training_steps: null
+    min_lr: 5.0e-7
 
   fsdp_config:
     strategy: "fsdp"
