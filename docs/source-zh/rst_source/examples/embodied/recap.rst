@@ -750,6 +750,37 @@ Subtask 预测训练（可选）
 把一次较长前缀的 attention 拆成两段，与完整重算存在约 1.8e-2 的 bf16 动作差异；需要逐位
 一致时不要开启前缀复用。
 
+从 ZERITH 权重热启动
+----------------------------------------
+
+ZERITH 训练保存的是 Orbax JAX 参数。``scripts/run_convert_zerith_jax_to_cfg.sh`` 把一个 step
+目录转成本训练可加载的 checkpoint（入口是
+``python -m rlinf.utils.ckpt_convertor.convert_pi05_jax_to_cfg``）：把 JAX 的 Gemma LoRA
+适配器合并回基础权重（RLinf 会在稠密权重上重新注入自己的适配器）、带上 ``subtask_classifier``
+分类头，并把 ``norm_stats.json`` 放到配置解析的 asset id 目录下。
+
+.. code:: bash
+
+   bash scripts/run_convert_zerith_jax_to_cfg.sh <jax-step-dir> <out-dir> zerith
+
+然后把训练配置指向它：
+
+.. code:: yaml
+
+   actor:
+     model:
+       model_path: <out-dir>
+       is_lora: true                    # 在合并后的基础权重上重新训适配器
+       openpi_data:
+         norm_stats_path: <out-dir>/zerith/norm_stats.json
+       openpi:
+         subtask_classification: true
+         num_subtask_classes: 13
+
+``params/`` 缺失、头的宽度或类别数与配置不一致、输出目录已存在（用 ``--overwrite`` 覆盖）时，
+转换器会直接报错而不是写出一个不完整的 checkpoint。动作专家的 ``lm_head`` 既不在 JAX 权重中、
+也不被策略使用，因此写成全 0。
+
 运行
 ----------------------------------------
 

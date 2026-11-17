@@ -24,16 +24,27 @@ set -euo pipefail
 DEFAULT_CKPT="/data/4T-1/hewu/alg-product/ZERITH_Pi_OPEN/openpi_checkpoints/pi05_zerith_subtask_cls/part_sorting_20261027_subtask_cls_headlr1e-3_16k_lr1e-5_bs8/15999"
 DEFAULT_OUT="/data/4T-1/hewu/model_zoo/pi05_zerith_subtask_cls_rlinf"
 
-CKPT=${CKPT:-${1:-${DEFAULT_CKPT}}}
-OUT=${OUT:-${2:-${DEFAULT_OUT}}}
-ASSET_ID=${ASSET_ID:-${3:-zerith}}
-EXTRA_ARGS=("${@:4}")
+# Positional overrides come first and are paths, so anything after the first
+# flag is forwarded to the python entry point instead of being read as a path.
+positional=()
+extra=()
+for arg in "$@"; do
+	if [[ ${#extra[@]} -eq 0 && $arg != -* && ${#positional[@]} -lt 3 ]]; then
+		positional+=("$arg")
+	else
+		extra+=("$arg")
+	fi
+done
+
+CKPT=${CKPT:-${positional[0]:-${DEFAULT_CKPT}}}
+OUT=${OUT:-${positional[1]:-${DEFAULT_OUT}}}
+ASSET_ID=${ASSET_ID:-${positional[2]:-zerith}}
 
 python -m rlinf.utils.ckpt_convertor.convert_pi05_jax_to_cfg \
 	--checkpoint-dir "${CKPT}" \
 	--output-dir "${OUT}" \
 	--asset-id "${ASSET_ID}" \
-	"${EXTRA_ARGS[@]}"
+	"${extra[@]}"
 
 cat <<EOF
 [convert] Done. Set these in the training config (examples/offline_rl/config):

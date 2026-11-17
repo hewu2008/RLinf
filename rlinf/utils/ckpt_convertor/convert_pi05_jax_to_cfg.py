@@ -63,6 +63,16 @@ _PI05_PROJECTION_KEYS = (
     "time_mlp_out",
 )
 
+# The JAX tree stores a single ``llm/embedder/input_embedding``: the PaliGemma
+# lm_head is tied to it (and used by the subtask text loss), while the action
+# expert's lm_head is neither stored nor used, because its outputs go through
+# ``action_out_proj``. HF/OpenPI still declares both as parameters.
+_TOKEN_EMBEDDING = (
+    "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+)
+_VLM_LM_HEAD = "paligemma_with_expert.paligemma.lm_head.weight"
+_UNUSED_LM_HEADS = ("paligemma_with_expert.gemma_expert.lm_head.weight",)
+
 
 def lora_keys(key: str) -> tuple[str, str, str] | None:
     """Return ``(base_key, a_key, b_key)`` for a LoRA parameter key, else ``None``.
@@ -233,10 +243,10 @@ def find_norm_stats(checkpoint_dir: str | pathlib.Path) -> pathlib.Path | None:
     return candidates[0] if candidates else None
 
 
-def _projection_state(params: dict, pi05: bool) -> dict[str, np.ndarray]:
+def _projection_state(params: dict, pi05: bool) -> dict[str, torch.Tensor]:
     """Map the action/time projection matrices onto torch ``Linear`` weights."""
     keys = _PI05_PROJECTION_KEYS if pi05 else ("state_proj", *_PI05_PROJECTION_KEYS)
-    state: dict[str, np.ndarray] = {}
+    state: dict[str, torch.Tensor] = {}
     for key in keys:
         if key not in params:
             raise KeyError(f"checkpoint is missing the {key!r} projection.")
@@ -246,22 +256,26 @@ def _projection_state(params: dict, pi05: bool) -> dict[str, np.ndarray]:
             kernel = kernel["value"]
         if isinstance(bias, dict):
             bias = bias["value"]
-        state[f"{key}.weight"] = np.asarray(kernel).T
-        state[f"{key}.bias"] = np.asarray(bias)
+        state[f"{key}.weight"] = torch.from_numpy(np.asarray(kernel).T).contiguous()
+        state[f"{key}.bias"] = torch.from_numpy(np.asarray(bias)).contiguous()
     return state
 
 
-def _tied_aliases(state: dict[str, torch.Tensor]) -> set[str]:
-    """Return state-dict keys that alias an earlier key through shared storage."""
-    seen: dict[int, str] = {}
-    aliases: set[str] = set()
+def _shared_storage_groups(state: dict[str, torch.Tensor]) -> dict[str, frozenset[str]]:
+    """Map every state key to the keys that alias it through shared storage.
+
+    ``safetensors.torch.save_model`` folds tied weights into one tensor and keeps
+    a single key, so a missing key is only acceptable when it has an alias.
+    """
+    by_pointer: dict[int, list[str]] = {}
     for name, tensor in state.items():
-        pointer = tensor.data_ptr()
-        if pointer in seen:
-            aliases.add(name)
-        else:
-            seen[pointer] = name
-    return aliases
+        by_pointer.setdefault(tensor.data_ptr(), []).append(name)
+    groups: dict[str, frozenset[str]] = {}
+    for names in by_pointer.values():
+        group = frozenset(names)
+        for name in names:
+            groups[name] = group
+    return groups
 
 
 def _lora_scaling(variant: str) -> float:
@@ -402,8 +416,11 @@ def convert(
             f"the head reads {head['width']} inputs but {config_name!r} builds a "
             f"{expected_width}-wide prefix."
         )
-    if head["num_classes"] != num_subtask_classes:
-        logger.info("head predicts %d subtask classes", head["num_classes"])
+    logger.info(
+        "subtask head: %d classes, %d hidden units",
+        head["num_classes"],
+        head["hidden_dim"],
+    )
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
     model.subtask_classifier = SubtaskClassifier(
@@ -415,11 +432,13 @@ def convert(
         **projection_params,
         **{key: torch.from_numpy(value) for key, value in head["state"].items()},
     }
+    if _TOKEN_EMBEDDING in state:
+        state[_VLM_LM_HEAD] = state[_TOKEN_EMBEDDING]
     incompatible = model.load_state_dict(state, strict=False)
-    if incompatible.missing_keys:
+    missing = [key for key in incompatible.missing_keys if key not in _UNUSED_LM_HEADS]
+    if missing:
         raise RuntimeError(
-            "the converted state is missing model tensors: "
-            f"{incompatible.missing_keys[:8]}"
+            f"the converted state is missing model tensors: {missing[:8]}"
         )
     if incompatible.unexpected_keys:
         logger.warning(
@@ -428,24 +447,31 @@ def convert(
             incompatible.unexpected_keys[:5],
         )
 
+    # The unused head keeps the model's random initialization otherwise, which
+    # would both change on every run and ship 0.5 GB of noise.
+    for key in _UNUSED_LM_HEADS:
+        model.get_parameter(key).detach().zero_()
+
     dtype = torch.bfloat16 if precision == "bfloat16" else torch.float32
     model = model.to(dtype=dtype)
     model.eval()
     output_dir.mkdir(parents=True, exist_ok=True)
-    aliases = _tied_aliases(model.state_dict())
+    groups = _shared_storage_groups(model.state_dict())
+    aliases = sum(1 for group in set(groups.values()) if len(group) > 1)
     safetensors.torch.save_model(model, str(weights_path))
     saved = safetensors.torch.load_file(str(weights_path), device="cpu")
     missing = sorted(set(model.state_dict()) - set(saved))
-    if set(missing) - aliases:
-        raise RuntimeError(
-            f"{weights_path} lost non-tied tensors: {sorted(set(missing) - aliases)[:8]}"
-        )
+    unaccounted = [key for key in missing if len(groups.get(key, frozenset())) == 1]
+    if unaccounted:
+        raise RuntimeError(f"{weights_path} lost non-tied tensors: {unaccounted[:8]}")
     logger.info(
-        "wrote %s: %d tensors (%s), %d tied aliases folded, head=%d classes",
+        "wrote %s: %d tensors (%s), %d tied aliases folded, %d aliased keys "
+        "dropped, head=%d classes",
         weights_path,
         len(saved),
         precision,
-        len(set(missing) & aliases),
+        aliases,
+        len(missing),
         head["num_classes"],
     )
 

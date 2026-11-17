@@ -772,6 +772,39 @@ bound, and about 230 ms for a typical 12-step subtask. Reusing the prefix splits
 attention into two passes, which differs from a full rebuild by about 1.8e-2 in bf16 actions;
 disable prefix reuse when bit-exact replay is required.
 
+Warm-Starting From a ZERITH Checkpoint
+--------------------------------------
+
+The ZERITH runs save Orbax JAX params. ``scripts/run_convert_zerith_jax_to_cfg.sh``
+(``python -m rlinf.utils.ckpt_convertor.convert_pi05_jax_to_cfg``) turns one step directory
+into a checkpoint this training starts from: it folds the JAX Gemma LoRA adapters into the base
+weights, because RLinf injects its own adapters on top of a dense base, carries the
+``subtask_classifier`` head over, and stages ``norm_stats.json`` under the asset id the config
+resolves.
+
+.. code:: bash
+
+   bash scripts/run_convert_zerith_jax_to_cfg.sh <jax-step-dir> <out-dir> zerith
+
+Then point the training config at it:
+
+.. code:: yaml
+
+   actor:
+     model:
+       model_path: <out-dir>
+       is_lora: true                    # fresh adapters on the merged base
+       openpi_data:
+         norm_stats_path: <out-dir>/zerith/norm_stats.json
+       openpi:
+         subtask_classification: true
+         num_subtask_classes: 13
+
+The converter fails instead of writing a partial checkpoint when ``params/`` is missing, when
+the head width or class count disagrees with the config, or when the output already exists
+(``--overwrite`` replaces it). The action expert's ``lm_head`` is neither stored by JAX nor used
+by the policy, so it is written as zeros.
+
 Run It
 ------
 
