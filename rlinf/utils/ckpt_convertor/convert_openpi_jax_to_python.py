@@ -52,6 +52,42 @@ from flax.nnx import traversals
 from openpi.training import utils
 
 
+def paligemma_torch_config():
+    """HF-shaped SigLIP + text config for the So400m/14 PaliGemma 2B backbone.
+
+    ``slice_paligemma_state_dict`` reads layer counts and widths off this object;
+    the numbers are the OpenPI gemma_2b variant, shared by pi0 and pi0.5.
+    """
+
+    class PaliGemmaConfig:
+        def __init__(self):
+            self.vision_config = type(
+                "obj",
+                (object,),
+                {
+                    "hidden_size": 1152,
+                    "num_hidden_layers": 27,
+                    "num_attention_heads": 16,
+                    "intermediate_size": 4304,
+                    "patch_size": 14,
+                    "projection_dim": 2048,
+                },
+            )()
+            self.text_config = type(
+                "obj",
+                (object,),
+                {
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 18,
+                    "num_attention_heads": 8,
+                    "head_dim": 256,
+                    "intermediate_size": 16384,
+                },
+            )()
+
+    return PaliGemmaConfig()
+
+
 def slice_paligemma_state_dict(state_dict, config):
     """Convert PaliGemma JAX parameters to PyTorch format."""
     suffix = "/value" if "img/embedding/kernel/value" in state_dict else ""
@@ -368,8 +404,9 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     )
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
-    # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    # Pi0.5 uses adaRMS on the action expert, Pi0 a plain RMSNorm. The flag is
+    # the source of truth; the checkpoint path may mention neither.
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(
             f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}"
@@ -432,7 +469,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             f"paligemma_with_expert.gemma_expert.model.layers.{i}.mlp.down_proj.weight"
         ] = llm_mlp_linear[i].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[
                 f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"
@@ -456,7 +493,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             ] = llm_post_attention_layernorm[i]
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(
             f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}"
@@ -580,35 +617,8 @@ def convert_pi0_checkpoint(
         projection_params[pytorch_weight_key] = torch.from_numpy(np.array(weight)).T
         projection_params[pytorch_bias_key] = torch.from_numpy(np.array(bias))
 
-    # Create configs based on checkpoint path
-    # All models use the same PaliGemma config structure
-    class PaliGemmaConfig:
-        def __init__(self):
-            self.vision_config = type(
-                "obj",
-                (object,),
-                {
-                    "hidden_size": 1152,
-                    "num_hidden_layers": 27,
-                    "num_attention_heads": 16,
-                    "intermediate_size": 4304,
-                    "patch_size": 14,
-                    "projection_dim": 2048,
-                },
-            )()
-            self.text_config = type(
-                "obj",
-                (object,),
-                {
-                    "hidden_size": 2048,
-                    "num_hidden_layers": 18,
-                    "num_attention_heads": 8,
-                    "head_dim": 256,
-                    "intermediate_size": 16384,
-                },
-            )()
-
-    paligemma_config = PaliGemmaConfig()
+    # All models use the same PaliGemma config structure.
+    paligemma_config = paligemma_torch_config()
     action_expert_config = openpi.models.gemma.get_config("gemma_300m")
 
     # Process PaliGemma weights
