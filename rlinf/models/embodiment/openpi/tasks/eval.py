@@ -362,11 +362,18 @@ class Pi0Eval(EnvIO, Pi0):
         logits = self.llm.embedder.decode(outputs[0][:, image_len + valid_len - 1])
         self._last_subtask_prefix = (prefix_mask, kv_cache, valid_len, image_len)
 
-        generated = self._graph_decode(image_len + budget, logits, kv_cache)
+        # ``budget`` pads the prefix so the decode graphs keep one shape, but the
+        # padding slots carry no prompt token: the first subtask token sits at
+        # ``image_len + valid_len`` and the decode masks ``[valid_len, budget)``
+        # out, matching the positions the model was trained on.
+        cache_len = image_len + budget
+        valid_prefix = image_len + valid_len
+        generated = self._graph_decode(cache_len, valid_prefix, logits, kv_cache)
         if generated is None:
             generated = self._eager_decode(
                 outputs[0][:, image_len + valid_len - 1],
-                image_len + budget,
+                cache_len,
+                valid_prefix,
                 kv_cache,
                 device,
             )
@@ -381,7 +388,7 @@ class Pi0Eval(EnvIO, Pi0):
             )
         return subtask
 
-    def _graph_decode(self, prefix_len, logits, kv_cache):
+    def _graph_decode(self, cache_len, valid_prefix, logits, kv_cache):
         """Decode with captured step graphs, or return None to fall back."""
         if (
             not self.subtask_decode_graph
@@ -393,21 +400,23 @@ class Pi0Eval(EnvIO, Pi0):
             SubtaskDecodeGraph,
         )
 
-        graph = self._subtask_decode_graphs.get(prefix_len)
+        graph = self._subtask_decode_graphs.get(cache_len)
         if graph is None:
             graph = SubtaskDecodeGraph(
-                self, prefix_len=prefix_len, max_steps=self.max_subtask_len
+                self, prefix_len=cache_len, max_steps=self.max_subtask_len
             )
-            self._subtask_decode_graphs[prefix_len] = graph
+            self._subtask_decode_graphs[cache_len] = graph
         if not graph.available:
             return None
-        generated = graph.generate(logits, kv_cache, eos_token=PALIGEMMA_EOS_TOKEN)
+        generated = graph.generate(
+            logits, kv_cache, eos_token=PALIGEMMA_EOS_TOKEN, valid_prefix=valid_prefix
+        )
         return generated or None
 
-    def _eager_decode(self, hidden, next_pos, kv_cache, device):
+    def _eager_decode(self, hidden, cache_len, valid_prefix, kv_cache, device):
         """Reference decode loop used when graphs are disabled or unavailable."""
         generated = []
-        for _ in range(self.max_subtask_len):
+        for step in range(self.max_subtask_len):
             logits = self.llm.embedder.decode(hidden)
             if self.subtask_temperature > 0.0:
                 probs = F.softmax(logits.float() / self.subtask_temperature, dim=-1)
@@ -417,11 +426,15 @@ class Pi0Eval(EnvIO, Pi0):
             generated.append(token)
             if int(token[0, 0]) == PALIGEMMA_EOS_TOKEN:
                 break
+            # The cache covers the padded prefix, so the mask has to reach
+            # ``cache_len + step + 1`` while the position keeps counting from
+            # the last real prompt token.
             step_mask = torch.ones(
-                (1, 1, next_pos + 1), dtype=torch.bool, device=device
+                (1, 1, cache_len + step + 1), dtype=torch.bool, device=device
             )
+            step_mask[..., valid_prefix:cache_len] = False
             step_positions = torch.full(
-                (1, 1), next_pos, dtype=torch.long, device=device
+                (1, 1), valid_prefix + step, dtype=torch.long, device=device
             )
             step_outputs, kv_cache = self.llm(
                 [self.llm.embed(token), None],
@@ -434,7 +447,6 @@ class Pi0Eval(EnvIO, Pi0):
                 return_prefix=True,
             )
             hidden = step_outputs[0][:, -1]
-            next_pos += 1
         return generated
 
     def _subtask_prefix_cache(

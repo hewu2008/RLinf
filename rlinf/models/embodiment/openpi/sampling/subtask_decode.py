@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 class _DecodeStep:
     graph: torch.cuda.CUDAGraph
     token: torch.Tensor
+    positions: torch.Tensor
+    mask: torch.Tensor
     input_kv: tuple
     output_kv: tuple
     logits: torch.Tensor
@@ -43,6 +45,11 @@ class SubtaskDecodeGraph:
     graphs are captured lazily per ``past_len`` because the KV cache and mask
     grow with every generated token, and the cache of the previous step is
     copied into the next step's static input buffer.
+
+    ``prefix_len`` is the padded prefix the caller caches, not the number of
+    real prompt tokens. The first generated token sits at ``valid_prefix`` and
+    the padding slots in ``[valid_prefix, prefix_len)`` stay masked, so the
+    replay sees the same token layout the model was trained on.
 
     Creation is best-effort: on a CPU-only host, or when capture raises, the
     caller falls back to the eager loop.
@@ -72,13 +79,18 @@ class SubtaskDecodeGraph:
         kv_cache: tuple,
         *,
         eos_token: int,
+        valid_prefix: int,
     ) -> list[torch.Tensor]:
         """Decode until EOS or ``max_steps`` and return the emitted tokens.
 
         Args:
             logits: ``(1, vocab)`` logits of the first generated token.
-            kv_cache: prefix KV cache from the prefix forward.
+            kv_cache: prefix KV cache from the prefix forward; it covers the
+                padded prefix, so it holds ``prefix_len`` tokens.
             eos_token: token id that stops generation.
+            valid_prefix: number of real prompt tokens in the cache. The first
+                generated token is placed at this position and the padding
+                after it is masked out.
 
         Returns:
             Generated token ids (including EOS when it was emitted). Empty when
@@ -87,6 +99,7 @@ class SubtaskDecodeGraph:
         if self._disabled:
             return []
 
+        valid_prefix = int(valid_prefix)
         generated: list[torch.Tensor] = []
         try:
             for step in range(1, self._max_steps + 1):
@@ -94,8 +107,15 @@ class SubtaskDecodeGraph:
                 generated.append(token)
                 if int(token[0, 0]) == eos_token:
                     break
-                entry = self._ensure_step(step, kv_cache)
+                entry = self._ensure_step(step, kv_cache, valid_prefix)
                 entry.token.copy_(token)
+                entry.positions.fill_(valid_prefix + step - 1)
+                # The mask is a static input too, because ``valid_prefix``
+                # changes with the digit count of the state string. Only the
+                # padding slots are hidden; previously generated tokens sit
+                # after ``prefix_len`` and must stay visible.
+                entry.mask.fill_(True)
+                entry.mask[..., valid_prefix : self._prefix_len] = False
                 for dst, src in zip(entry.input_kv, kv_cache, strict=True):
                     for dst_tensor, src_tensor in zip(dst, src, strict=True):
                         dst_tensor.copy_(src_tensor)
@@ -110,14 +130,19 @@ class SubtaskDecodeGraph:
             return []
         return generated
 
-    def _ensure_step(self, step: int, kv_cache: tuple) -> _DecodeStep:
+    def _ensure_step(
+        self, step: int, kv_cache: tuple, valid_prefix: int
+    ) -> _DecodeStep:
         if (entry := self._steps.get(step)) is not None:
             return entry
 
-        past = self._prefix_len + step - 1
+        cache_len = self._prefix_len + step - 1
         token = torch.zeros((1, 1), dtype=torch.long, device=kv_cache[0][0].device)
-        positions = torch.full((1, 1), past, dtype=torch.long, device=token.device)
-        mask = torch.ones((1, 1, past + 1), dtype=torch.bool, device=token.device)
+        positions = torch.full(
+            (1, 1), valid_prefix + step - 1, dtype=torch.long, device=token.device
+        )
+        mask = torch.ones((1, 1, cache_len + 1), dtype=torch.bool, device=token.device)
+        mask[..., valid_prefix : self._prefix_len] = False
         input_kv = tuple((k.clone(), v.clone()) for k, v in kv_cache)
 
         # The rope / gated-residual kernels are wrapped in torch.compile; a lazy
@@ -161,6 +186,8 @@ class SubtaskDecodeGraph:
         entry = _DecodeStep(
             graph=graph,
             token=token,
+            positions=positions,
+            mask=mask,
             input_kv=input_kv,
             output_kv=output_kv,
             logits=logits,
