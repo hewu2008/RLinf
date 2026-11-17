@@ -104,8 +104,10 @@ class LeRobotZerithDataConfig(DataConfigFactory):
         repack_inputs = []
         if subtask:
             # Runs before the repack so it reads the raw `subtask_index` column;
-            # the whitelist below keeps the mapped text alive.
+            # the whitelist below keeps the mapped text and the integer class id
+            # (read by the subtask classification head) alive.
             repack_structure["subtask"] = "subtask"
+            repack_structure["subtask_class"] = "subtask_class"
             repack_inputs.append(SubtaskFromIndex(self.subtasks or {}))
         repack_inputs.append(_transforms.RepackTransform(repack_structure))
         repack_transform = _transforms.Group(inputs=repack_inputs)

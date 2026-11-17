@@ -103,6 +103,7 @@ class PolicyService:
                 )
         self._cfg_scale = float(getattr(self._model, "cfgrl_guidance_scale", 0.0))
         self._guidance_type = getattr(self._model, "guidance_type", "off")
+        self._subtask_mode = getattr(self._model, "subtask_mode", None)
         chunk = getattr(self._model, "action_chunk", None) or self._model.action_horizon
         self._metadata = build_metadata(
             action_horizon=int(chunk),
@@ -112,7 +113,7 @@ class PolicyService:
         )
         logger.info(
             "policy ready on %s: horizon=%d action_dim=%d rtc=%s "
-            "cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s",
+            "cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s subtask=%s",
             self._device,
             chunk,
             self._action_dim,
@@ -120,6 +121,7 @@ class PolicyService:
             self._cfg_scale,
             self._guidance_type,
             "advantage" if self._cfg_scale > 0.0 else "off",
+            self._subtask_mode or "off",
         )
 
     @property

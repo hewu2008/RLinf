@@ -98,12 +98,15 @@ class ZerithInputs(transforms.DataTransformFn):
             )
 
         # Forward the per-frame subtask text (pi0.5 subtask prediction) to the
-        # model transforms, which build the subtask token layout from it.
+        # model transforms, which build the subtask token layout from it, and its
+        # integer class id for the subtask classification head.
         if "subtask" in data:
             subtask = data["subtask"]
             inputs["subtask"] = (
                 subtask.decode("utf-8") if isinstance(subtask, bytes) else subtask
             )
+        if "subtask_class" in data:
+            inputs["subtask_class"] = data["subtask_class"]
 
         return inputs
 

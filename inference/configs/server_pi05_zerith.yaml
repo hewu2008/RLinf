@@ -52,16 +52,29 @@ openpi:
   # with clip=5 therefore overshoots the overlap target and shows up as a jolt
   # at every replan on the real robot; lower the clip or use "exact".
   rtc_guidance_clip: 5.0
-  # pi0.5 subtask stage: generate the subtask text from the prefix and
-  # condition the action branch on it. Requires a checkpoint trained with
-  # train_subtask_prediction. The subtask is regenerated on every request from
-  # the current observation (the loop cannot enter the CUDA graph); keep
-  # max_subtask_len small to stay inside the control-period budget.
+  # pi0.5 subtask stage: the VLM decides the current subtask and the action
+  # branch is conditioned on it. Requires a checkpoint trained with
+  # train_subtask_prediction. Two stages are available and the choice is
+  # orthogonal to the training loss:
+  #   classifier - one extra prefix forward plus the classification head, no
+  #                per-token decode. Needs subtask_classification training.
+  #   generate   - autoregressive text decoding from the prefix slots.
+  #   off        - skip the stage and sample from the plain prompt.
+  # "auto" prefers the classifier and falls back to generation.
+  subtask_mode: classifier
+  subtask_classification: true
+  # Number of subtask classes; must match the rows of the class table below.
+  num_subtask_classes: 13
+  subtask_class_hidden_dim: 512
+  # Class id -> text table used to turn a predicted class back into the prompt
+  # text. Point at the jsonl file, its directory, or the dataset root.
+  subtask_classes_path: /data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask/meta/subtasks.jsonl
   sample_subtask_prediction: true
   subtask_temperature: 0.0
   max_subtask_len: 24
   # Replay each decode step from a captured CUDA graph (falls back to eager
-  # without CUDA). Measured 15 ms -> 6 ms per token on the 2B model.
+  # without CUDA). Measured 15 ms -> 6 ms per token on the 2B model; ignored by
+  # the classifier stage, which never decodes.
   subtask_decode_graph: true
   # Classifier-free guidance: every denoise step mixes the plain-prompt branch
   # with an advantage-conditioned one, (1 - β)·v_plain + β·v_advantage, where the

@@ -125,17 +125,30 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     if max_token_len is not None:
         pi0_kwargs["max_token_len"] = int(max_token_len)
 
-    for key in ("train_subtask_prediction", "sample_subtask_prediction"):
+    for key in (
+        "train_subtask_prediction",
+        "sample_subtask_prediction",
+        "subtask_classification",
+    ):
         value = OmegaConf.select(model_cfg, key, default=None)
         if value is not None:
             pi0_kwargs[key] = bool(value)
     value = OmegaConf.select(model_cfg, "subtask_decode_graph", default=None)
     if value is not None:
         pi0_kwargs["subtask_decode_graph"] = bool(value)
-    for key, cast in (("subtask_loss_weight", float), ("max_subtask_len", int)):
+    for key, cast in (
+        ("subtask_loss_weight", float),
+        ("max_subtask_len", int),
+        ("num_subtask_classes", int),
+        ("subtask_class_hidden_dim", int),
+    ):
         value = OmegaConf.select(model_cfg, key, default=None)
         if value is not None:
             pi0_kwargs[key] = cast(value)
+    subtask_mode = OmegaConf.select(model_cfg, "subtask_mode", default=None)
+    if subtask_mode is not None:
+        pi0_kwargs["subtask_mode"] = str(subtask_mode)
+    subtask_classes = _resolve_subtask_classes(model_cfg)
 
     pi0_config = Pi0Config(**pi0_kwargs)
     rlt_cfg = build_rlt_config(model_cfg)
@@ -147,6 +160,15 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
 
     task = OmegaConf.select(model_cfg, "task", default="sft")
     task = str(task).lower() if task is not None else "sft"
+    if task == "eval" and pi0_config.subtask_classification:
+        mode = pi0_config.subtask_mode
+        if mode in (None, "auto", "classifier") and subtask_classes is None:
+            raise ValueError(
+                "subtask_classification needs the class table to turn a predicted "
+                "class id back into the subtask text: set "
+                "openpi.subtask_classes_path to the dataset's meta/subtasks.jsonl "
+                "or list the texts in openpi.subtask_classes."
+            )
 
     if task == "sft":
         model = Pi0(
@@ -155,6 +177,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             action_env_dim=action_env_dim,
             action_chunk=action_chunk,
             rlt_cfg=rlt_cfg,
+            subtask_classes=subtask_classes,
         )
     elif task == "eval":
         from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval
@@ -166,6 +189,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             config_name=config_name,
             state_indices=OmegaConf.select(model_cfg, "state_indices", default=None),
             rlt_cfg=rlt_cfg,
+            subtask_classes=subtask_classes,
             rtc_enabled=bool(OmegaConf.select(model_cfg, "rtc_enabled", default=False)),
             rtc_guidance_mode=str(
                 OmegaConf.select(model_cfg, "rtc_guidance_mode", default="approx")
@@ -430,6 +454,74 @@ def _require_config_name(model_cfg, task: str) -> str:
     return config_name
 
 
+def _resolve_subtask_classes(model_cfg) -> list[str] | None:
+    """Resolve the class-id -> subtask text table of the classification head.
+
+    Accepts either an inline ``openpi.subtask_classes`` list (class id = list
+    position) or ``openpi.subtask_classes_path`` pointing at the dataset's
+    ``meta/subtasks.jsonl``. The ids have to be contiguous because they are the
+    classifier's output indices, and their count is cross-checked against
+    ``num_subtask_classes`` so a stale table cannot silently shift labels.
+
+    Args:
+        model_cfg: ``actor.model`` config node.
+
+    Returns:
+        Subtask texts ordered by class id, or ``None`` when no table is set.
+    """
+    from omegaconf import OmegaConf
+
+    inline = OmegaConf.select(model_cfg, "subtask_classes", default=None)
+    path = OmegaConf.select(model_cfg, "subtask_classes_path", default=None)
+    if inline is not None and path is not None:
+        raise ValueError(
+            "set only one of openpi.subtask_classes and "
+            "openpi.subtask_classes_path; both are configured."
+        )
+    if inline is not None:
+        texts = [str(text) for text in inline]
+        table = dict(enumerate(texts))
+    elif path is not None:
+        from rlinf.models.embodiment.openpi.transforms.subtask import (
+            load_subtask_table,
+        )
+
+        table = load_subtask_table(path)
+    else:
+        return None
+
+    indices = sorted(table)
+    if indices != list(range(len(indices))):
+        raise ValueError(
+            f"the subtask class table needs contiguous indices 0..K-1; got {indices}."
+        )
+    configured = OmegaConf.select(model_cfg, "num_subtask_classes", default=None)
+    if configured is not None and int(configured) != len(indices):
+        raise ValueError(
+            f"actor.model.openpi.num_subtask_classes={int(configured)} but the "
+            f"class table has {len(indices)} entries."
+        )
+    texts = [table[index] for index in indices]
+    logger.info(
+        "openpi: loaded %d subtask classes: %s",
+        len(texts),
+        "; ".join(f"{index}={text}" for index, text in enumerate(texts)),
+    )
+    return texts
+
+
+def _subtask_stage_enabled(cfg) -> bool:
+    """Whether serving runs a subtask stage, and so needs its tokenizer."""
+    from omegaconf import OmegaConf
+
+    if bool(OmegaConf.select(cfg, "openpi.sample_subtask_prediction", default=False)):
+        return True
+    if bool(OmegaConf.select(cfg, "openpi.subtask_classification", default=False)):
+        return True
+    mode = OmegaConf.select(cfg, "openpi.subtask_mode", default=None)
+    return mode is not None and str(mode) in ("auto", "classifier", "generate")
+
+
 def _resolve_data_kwargs(cfg):
     from omegaconf import OmegaConf
 
@@ -438,9 +530,9 @@ def _resolve_data_kwargs(cfg):
         data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
     else:
         data_kwargs = {}
-    if OmegaConf.select(cfg, "openpi.sample_subtask_prediction", default=False):
+    if _subtask_stage_enabled(cfg):
         # The serving pipeline needs the subtask tokenizer installed so the
-        # action branch can be conditioned on the generated text.
+        # action branch can be conditioned on the predicted text.
         data_kwargs.setdefault("subtask_prediction", True)
     return data_kwargs or None
 

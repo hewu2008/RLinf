@@ -58,7 +58,41 @@ def load_subtasks(root: str | pathlib.Path) -> dict[int, str]:
     path = pathlib.Path(root) / "meta" / "subtasks.jsonl"
     if not path.exists():
         return {}
+    return _parse_subtasks_file(path)
 
+
+def load_subtask_table(path: str | pathlib.Path) -> dict[int, str]:
+    """Load ``{subtask_index: text}`` from a ``subtasks.jsonl`` path or a root.
+
+    Serving needs the class table the head was trained against, and the deploy
+    directory does not necessarily hold the dataset. Accepted locations are the
+    jsonl file itself, a ``meta`` directory, or a dataset root.
+
+    Args:
+        path: ``subtasks.jsonl`` file, the directory holding it, ``meta``
+            directory, or dataset root.
+
+    Returns:
+        Mapping from subtask index to its text.
+
+    Raises:
+        FileNotFoundError: No ``subtasks.jsonl`` is reachable from ``path``.
+    """
+    candidate = pathlib.Path(path).expanduser()
+    if candidate.is_file():
+        return _parse_subtasks_file(candidate)
+    if (candidate / "meta" / "subtasks.jsonl").is_file():
+        return _parse_subtasks_file(candidate / "meta" / "subtasks.jsonl")
+    if (candidate / "subtasks.jsonl").is_file():
+        return _parse_subtasks_file(candidate / "subtasks.jsonl")
+    raise FileNotFoundError(
+        "no subtasks.jsonl found for the subtask class table; pass the file, "
+        f"its directory, or the dataset root as openpi.subtask_classes_path (got {path})"
+    )
+
+
+def _parse_subtasks_file(path: pathlib.Path) -> dict[int, str]:
+    """Parse one ``{"subtask_index", "subtask"}`` record per line."""
     subtasks: dict[int, str] = {}
     for line in path.read_text().splitlines():
         if not (line := line.strip()):
@@ -75,7 +109,9 @@ class SubtaskFromIndex(DataTransformFn):
     The ``subtask`` key is always set: an empty string marks a frame without an
     annotation (``-1`` or an unknown index), which keeps the subtask loss off
     for that frame while still letting the tokenizer tell a training frame from
-    a serving request.
+    a serving request. ``subtask_class`` carries the same frame as an integer
+    class id for the classification head, with ``-1`` for the same frames so
+    the class loss can ignore them.
     """
 
     subtasks: Mapping[int, str]
@@ -85,7 +121,11 @@ class SubtaskFromIndex(DataTransformFn):
         class_id = -1 if index is None else int(index)
         if class_id not in self.subtasks:
             class_id = -1
-        return {**data, "subtask": self.subtasks.get(class_id, "")}
+        return {
+            **data,
+            "subtask": self.subtasks.get(class_id, ""),
+            "subtask_class": np.int32(class_id),
+        }
 
 
 class SubtaskPaligemmaTokenizer:

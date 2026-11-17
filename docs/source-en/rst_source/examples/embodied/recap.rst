@@ -674,8 +674,8 @@ Subtask Prediction Training (Optional)
 Long-horizon tasks such as sorting several parts depend on language to decide which arm to use,
 which object to pick, and which bin to drop it in. The pi0.5 subtask stage lets the VLM predict the
 current subtask as text and conditions the action expert on it, turning that decision from a visual
-inference into an explicit input. This implementation trains a token-level subtask cross-entropy
-only; there is **no classification head**.
+inference into an explicit input. This implementation trains a token-level subtask cross-entropy,
+and can optionally train a classification head on the same frames.
 
 **Data requirements**
 
@@ -703,10 +703,29 @@ only; there is **no classification head**.
          train_subtask_prediction: true
          subtask_loss_weight: 1.0     # weight of the subtask CE against the action loss
          max_subtask_len: 20          # cap on the supervised and generated subtask length
+         subtask_classification: true # optional classification head on the same frames
+         num_subtask_classes: 13      # rows of meta/subtasks.jsonl
+         subtask_class_loss_weight: 0.2
+         subtask_class_lr_multiplier: 100.0
 
 Training logs then add ``subtask_loss``; CFG training also reports ``subtask_token_accuracy``.
 A dataset without ``subtasks.jsonl`` falls back to the plain pi0.5 prompt on every frame, so the
 subtask loss stays zero.
+
+**Classification head**
+
+Decoding the subtask costs one forward per token. ``subtask_classification`` additionally trains a
+``LayerNorm -> Linear -> GELU -> Linear`` head that reads the prefix hidden state at the ``Subtask: ``
+cue token (the same token the first generated token reads from in both the training and the serving
+layout) and predicts a class id. Its cross-entropy is added to the action loss with
+``subtask_class_loss_weight``, ``-1`` frames are ignored exactly like the token-level loss, and the
+token-level loss keeps training alongside it, so one run serves both serving stages.
+
+The class ids are the ``subtask_index`` values of ``meta/subtasks.jsonl``, which therefore has to be
+``0..num_subtask_classes-1``; a mismatch fails the run instead of shifting labels. The head starts
+from random weights on a converged backbone, so it takes its own optimizer group at
+``subtask_class_lr_multiplier`` times ``actor.optim.lr`` (the FSDP optimizer splits parameter groups
+by name). Training logs add ``subtask_class_loss`` and ``subtask_class_accuracy``.
 
 .. note::
 
@@ -716,16 +735,33 @@ subtask loss stays zero.
 
 **Inference**
 
-Serving uses two stages: generate the subtask from the ``Task/State/\nSubtask: `` prefix, then
-re-encode the generated text in the training layout and hand it to the existing denoiser (RTC and
-CFG guidance are unchanged). Server configuration:
+Serving has three modes, selected by ``subtask_mode``:
+
+- ``classifier``: one prefix forward plus the classification head, then the predicted class text
+  conditions the action branch. No per-token decode.
+- ``generate``: generate the subtask from the ``Task/State/\nSubtask: `` prefix, then re-encode the
+  generated text in the training layout.
+- ``off``: sample from the plain prompt without a subtask stage. ``auto`` (or no value) prefers the
+  classifier and falls back to generation.
+
+Either way the existing denoiser consumes the resulting text unchanged (RTC and CFG guidance are
+unaffected). Server configuration:
 
 .. code:: yaml
 
    openpi:
+     subtask_mode: classifier
+     subtask_classification: true
+     num_subtask_classes: 13
+     subtask_classes_path: <dataset>/meta/subtasks.jsonl   # class id -> text
      sample_subtask_prediction: true
      subtask_temperature: 0.0       # 0.0 is greedy decoding
      max_subtask_len: 20
+
+The classifier needs the class table to turn a predicted id back into the prompt text; point
+``subtask_classes_path`` at the jsonl file, its directory, or the dataset root, or list the texts in
+``subtask_classes``. The head weights are ordinary ``subtask_classifier.*`` tensors, so they follow
+the checkpoint through the LoRA merge into the deploy directory.
 
 Subtask generation depends on the current observation and is regenerated on every request. The
 full loop cannot enter a CUDA graph, but each decode step can (`subtask_decode_graph`): about

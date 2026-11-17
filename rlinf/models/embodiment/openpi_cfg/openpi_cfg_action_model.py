@@ -30,6 +30,13 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from torch.utils._pytree import tree_map
 
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.openpi.modules.subtask import (
+    SubtaskClassifier,
+    subtask_cue_hidden,
+)
+from rlinf.models.embodiment.openpi.modules.subtask import (
+    subtask_class_loss as compute_subtask_class_loss,
+)
 
 ArrayT = TypeVar("ArrayT", bound=torch.Tensor | np.ndarray)
 
@@ -41,6 +48,10 @@ class Observation(Obs[ArrayT]):
     tokenized_positive_guidance_prompt_mask: ArrayT | None = None  # noqa: F722
     tokenized_negative_guidance_prompt: ArrayT | None = None  # noqa: F722
     tokenized_negative_guidance_prompt_mask: ArrayT | None = None  # noqa: F722
+    # Per-frame subtask class id for the classification head; -1 marks a frame
+    # without an annotation. It rides in this RLinf-owned dataclass because the
+    # upstream OpenPI Observation drops keys it does not declare.
+    subtask_class: ArrayT | None = None  # noqa: F722
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -97,6 +108,7 @@ class Observation(Obs[ArrayT]):
             ),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            subtask_class=data.get("subtask_class"),
         )
 
 
@@ -175,10 +187,23 @@ class OpenPi0Config(Pi0Config):
     positive_only_conditional: bool = False
 
     # pi0.5 subtask prediction: a token-level cross-entropy on the subtask text.
-    # The classification head is intentionally not implemented.
     train_subtask_prediction: bool = False
     subtask_loss_weight: float = 0.1
     max_subtask_len: int = 24
+    # Fast subtask readout: a lightweight classifier on the prefix cue token
+    # predicts the class of the current subtask instead of decoding its text.
+    # Training keeps the token-level loss as well, so one run serves both
+    # serving modes.
+    subtask_classification: bool = False
+    # Number of subtask classes, i.e. rows of the dataset's
+    # `meta/subtasks.jsonl`; required when classification is on.
+    num_subtask_classes: int = 0
+    subtask_class_hidden_dim: int = 512
+    # Weight of the subtask class cross-entropy added to the action loss.
+    subtask_class_loss_weight: float = 0.2
+    # The head is randomly initialized while the backbone is converged, so it
+    # takes its own optimizer group with a larger lr (same warmup/cosine shape).
+    subtask_class_lr_multiplier: float = 100.0
 
     def __post_init__(self):
         if self.guidance_type not in _VALID_GUIDANCE_TYPES:
@@ -193,6 +218,28 @@ class OpenPi0Config(Pi0Config):
         if not isinstance(self.num_steps, int) or self.num_steps <= 0:
             raise ValueError(
                 f"num_steps must be a positive integer, got {self.num_steps}"
+            )
+        self.validate_subtask_classification()
+
+    def validate_subtask_classification(self) -> None:
+        """Reject a classification setup the model cannot train.
+
+        The head reads the subtask prompt layout, so it needs both the subtask
+        prediction loss and a class table. ``openpi_cfg.get_model`` copies YAML
+        overrides onto the instance instead of rebuilding the dataclass, which
+        is why this check is also called from the model constructor.
+        """
+        if not self.subtask_classification:
+            return
+        if not self.train_subtask_prediction:
+            raise ValueError(
+                "subtask_classification requires train_subtask_prediction=True: "
+                "the classifier reads the subtask prompt layout (Subtask: cue)."
+            )
+        if self.num_subtask_classes <= 0:
+            raise ValueError(
+                "num_subtask_classes must be positive when "
+                f"subtask_classification is on; got {self.num_subtask_classes}."
             )
 
 
@@ -250,6 +297,26 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         self.train_subtask_prediction = bool(config.train_subtask_prediction)
         self.subtask_loss_weight = float(config.subtask_loss_weight)
         self.max_subtask_len = int(config.max_subtask_len)
+        config.validate_subtask_classification()
+        self.subtask_classification = bool(config.subtask_classification)
+        self.subtask_class_loss_weight = float(config.subtask_class_loss_weight)
+        self.subtask_classifier: SubtaskClassifier | None = None
+        if self.subtask_classification:
+            import openpi.models.gemma as _gemma
+
+            # fp32 readout of the bf16 residual stream: the two layers are ~1M
+            # parameters against the 2B VLM, so the extra copy is free.
+            self.subtask_classifier = SubtaskClassifier(
+                _gemma.get_config(config.paligemma_variant).width,
+                int(config.subtask_class_hidden_dim),
+                int(config.num_subtask_classes),
+            ).to(torch.float32)
+            # The head is randomly initialized while the backbone is converged,
+            # so it takes its own optimizer group (see
+            # ``FSDPModelManager.build_optimizer``) with a scaled lr.
+            self.lr_multipliers = {
+                "subtask_classifier": float(config.subtask_class_lr_multiplier)
+            }
         for name, module in self.named_modules():
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
@@ -518,6 +585,31 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         accuracy = (logits.argmax(dim=-1) == target).float().mean().item()
         return ce.mean(), accuracy
 
+    def subtask_class_logits(
+        self, prefix_out: torch.Tensor, observation: Observation
+    ) -> torch.Tensor:
+        """``(B, num_classes)`` subtask logits from the prefix cue hidden state."""
+        if self.subtask_classifier is None:
+            raise ValueError("Subtask classification head is disabled in this config.")
+        cue = subtask_cue_hidden(
+            prefix_out, getattr(observation, "token_ar_mask", None)
+        )
+        return self.subtask_classifier(cue.float())
+
+    def subtask_class_ce(
+        self, prefix_out: torch.Tensor, observation: Observation
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Masked subtask class cross-entropy, accuracy, and annotated count."""
+        labels = getattr(observation, "subtask_class", None)
+        if labels is None:
+            raise ValueError(
+                "subtask_class is required for the classification head; the data "
+                "pipeline did not carry the per-frame subtask label."
+            )
+        return compute_subtask_class_loss(
+            self.subtask_class_logits(prefix_out, observation), labels
+        )
+
     @staticmethod
     def _masked_loss_sum(per_sample_loss: torch.Tensor, mask: torch.Tensor) -> float:
         """Return the summed loss over a boolean mask."""
@@ -683,6 +775,20 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             total_loss = flow_loss + self.subtask_loss_weight * subtask_loss
             metrics["subtask_loss"] = float(subtask_loss.detach().item())
             metrics["subtask_token_accuracy"] = subtask_accuracy
+
+        if self.subtask_classification:
+            class_loss, class_accuracy, class_count = self.subtask_class_ce(
+                prefix_out, observation
+            )
+            total_loss = total_loss + self.subtask_class_loss_weight * class_loss
+            metrics["subtask_class_count"] = float(class_count.detach().item())
+            # A batch of unannotated frames carries no signal; reporting a zero
+            # loss for it would drag the curve down for free.
+            if float(class_count.detach().item()) > 0.0:
+                metrics["subtask_class_loss"] = float(class_loss.detach().item())
+                metrics["subtask_class_accuracy"] = float(
+                    class_accuracy.detach().item()
+                )
 
         return total_loss, metrics
 

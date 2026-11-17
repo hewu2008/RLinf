@@ -664,7 +664,8 @@ Subtask 预测训练（可选）
 
 在长时任务（如多零件抓取与放置）中，"当前应使用哪只手、抓取哪个物体、放入哪个 bin"
 通常由语言描述决定。pi0.5 的 subtask 阶段让 VLM 先预测当前子任务文本，动作专家再以该文本为条件，
-可以把这类信息从"靠视觉推断"变成"显式条件"。本实现只训练 token 级子任务交叉熵，**不包含分类头**。
+可以把这类信息从"靠视觉推断"变成"显式条件"。本实现训练 token 级子任务交叉熵，并可选地在同一批
+帧上额外训练一个分类头。
 
 **数据要求**
 
@@ -690,9 +691,27 @@ Subtask 预测训练（可选）
          train_subtask_prediction: true
          subtask_loss_weight: 1.0     # 子任务交叉熵相对动作损失的权重
          max_subtask_len: 20          # 监督/生成子任务的最大 token 数
+         subtask_classification: true # 可选：在同一批帧上训练分类头
+         num_subtask_classes: 13      # meta/subtasks.jsonl 的行数
+         subtask_class_loss_weight: 0.2
+         subtask_class_lr_multiplier: 100.0
 
 开启后，训练日志会额外输出 ``subtask_loss``；CFG 训练还会输出 ``subtask_token_accuracy``。
 若数据集缺少 ``subtasks.jsonl``，所有帧会回退到普通 pi0.5 prompt，子任务损失恒为 0。
+
+**分类头**
+
+自回归生成子任务需要每个 token 一次前向。``subtask_classification`` 额外训练一个
+``LayerNorm -> Linear -> GELU -> Linear`` 读出头，读取 ``Subtask: `` 之后的 cue token 的 prefix
+隐状态（训练布局与推理布局下，它都是第一个生成 token 读的那个位置），直接预测类别 id。其交叉熵
+以 ``subtask_class_loss_weight`` 加到动作损失上，``-1`` 帧与 token 级损失一样被忽略；token 级损失
+同时继续训练，所以一次训练可同时支持两种推理方式。
+
+类别 id 就是 ``meta/subtasks.jsonl`` 的 ``subtask_index``，因此它必须是
+``0..num_subtask_classes-1``；不一致时训练直接报错，而不是静默错标。分类头是随机初始化的，而骨干
+已收敛，所以它单独占一个优化器参数组，学习率为 ``subtask_class_lr_multiplier`` 倍
+``actor.optim.lr``（FSDP 优化器按名字拆分参数组）。训练日志新增 ``subtask_class_loss`` 与
+``subtask_class_accuracy``。
 
 .. note::
 
@@ -701,15 +720,29 @@ Subtask 预测训练（可选）
 
 **推理**
 
-推理分两阶段：先从 ``Task/State/\nSubtask: `` 前缀自回归生成子任务文本，再将生成的文本重新
-编码为上述训练布局，交给原有的去噪采样（RTC 与 CFG 引导保持不变）。服务端配置：
+推理由 ``subtask_mode`` 选择子任务阶段：
+
+- ``classifier``：一次 prefix 前向加分类头，再用预测出的类别文本作为动作分支的条件，不再逐 token 解码；
+- ``generate``：从 ``Task/State/\nSubtask: `` 前缀自回归生成子任务文本，再按训练布局重新编码；
+- ``off``：不启用子任务阶段，直接用普通 prompt 采样。``auto``（或不填）优先使用分类头，没有分类头
+  时回退到生成。
+
+两种方式得到的文本都交给原有的去噪采样，RTC 与 CFG 引导保持不变。服务端配置：
 
 .. code:: yaml
 
    openpi:
+     subtask_mode: classifier
+     subtask_classification: true
+     num_subtask_classes: 13
+     subtask_classes_path: <dataset>/meta/subtasks.jsonl   # 类别 id -> 文本
      sample_subtask_prediction: true
      subtask_temperature: 0.0       # 0 为贪心解码
      max_subtask_len: 20
+
+分类头需要类别表才能把预测的 id 换回 prompt 文本：``subtask_classes_path`` 可指向 jsonl 文件、
+其所在目录或数据集根目录，也可以直接在 ``subtask_classes`` 里按顺序列举文本。头的权重就是普通的
+``subtask_classifier.*`` 张量，会随 checkpoint 一起经过 LoRA 合并进入部署目录。
 
 子任务生成依赖当前观测，每个推理请求都会重新生成。生成循环本身不能整体进入 CUDA Graph，
 但每个解码步可以单独捕获（``subtask_decode_graph``）：单步从约 15 ms 降到 6 ms，20 步生成

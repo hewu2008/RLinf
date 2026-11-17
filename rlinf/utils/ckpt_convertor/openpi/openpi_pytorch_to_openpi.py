@@ -270,7 +270,8 @@ def old_to_new_state_dict(
             lm_head_key
         ]
 
-    # Action head (same names in both layouts)
+    # Action head and the pi0.5 subtask classification head (same names in both
+    # layouts)
     for key in openpi_pytorch_state_dict:
         if key.startswith(
             (
@@ -280,6 +281,7 @@ def old_to_new_state_dict(
                 "state_proj",
                 "action_time_mlp_",
                 "pointnet.",
+                "subtask_classifier.",
             )
         ):
             openpi_state_dict[key] = openpi_pytorch_state_dict[key]

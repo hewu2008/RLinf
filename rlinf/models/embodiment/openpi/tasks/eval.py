@@ -42,6 +42,36 @@ CFG_GUIDANCE_TYPES = ("positive", "negative")
 """Advantage suffixes the CFG-RL training data used for the conditioned branch."""
 
 
+def _resolve_subtask_mode(config: Pi0Config) -> str | None:
+    """Pick the sub-task stage of this checkpoint.
+
+    ``auto`` (and the unset default) prefers the classification head, because it
+    is one prefix forward instead of one decode step per token, and falls back
+    to autoregressive generation when only that was trained. An explicit mode
+    still has to be supported by the checkpoint, so a typo cannot silently
+    disable the stage.
+
+    Args:
+        config: Model config of the checkpoint.
+
+    Returns:
+        ``"classifier"``, ``"generate"``, or ``None`` for no sub-task stage.
+    """
+    mode = config.subtask_mode
+    if mode == "off":
+        return None
+    if mode in (None, "auto"):
+        if config.subtask_classification:
+            return "classifier"
+        return "generate" if config.sample_subtask_prediction else None
+    if mode == "classifier" and not config.subtask_classification:
+        raise ValueError(
+            "subtask_mode='classifier' needs a checkpoint trained with "
+            "subtask_classification=True; this model config has no head."
+        )
+    return mode
+
+
 def advantage_prompts(descriptions: Sequence[str], guidance_type: str) -> list[str]:
     """Append the advantage suffix that conditions the CFG branch."""
     if guidance_type not in CFG_GUIDANCE_TYPES:
@@ -73,6 +103,7 @@ class Pi0Eval(EnvIO, Pi0):
         rtc_guidance_steps: int | None = None,
         cfgrl_guidance_scale: float = 0.0,
         guidance_type: str = "positive",
+        subtask_classes: Sequence[str] | None = None,
     ):
         super().__init__(
             config,
@@ -82,6 +113,7 @@ class Pi0Eval(EnvIO, Pi0):
             config_name=config_name,
             state_indices=state_indices,
             rlt_cfg=rlt_cfg,
+            subtask_classes=subtask_classes,
         )
         if not math.isfinite(cfgrl_guidance_scale) or cfgrl_guidance_scale < 0.0:
             raise ValueError(
@@ -106,6 +138,10 @@ class Pi0Eval(EnvIO, Pi0):
         )
         self.cfgrl_guidance_scale = float(cfgrl_guidance_scale)
         self.guidance_type = guidance_type
+        # Sub-task stage: ``classifier`` reads a fixed class out of the prefix,
+        # ``generate`` decodes the subtask text token by token, ``None`` skips
+        # the stage. Both stages condition the action branch on the text.
+        self.subtask_mode = _resolve_subtask_mode(config)
         # Both stay ``None`` (the eager loops) until enable_sampler_graph swaps
         # in captured CUDA graphs.
         self._rtc_denoise_fn = None
@@ -121,7 +157,7 @@ class Pi0Eval(EnvIO, Pi0):
         self._last_subtask_prefix = None
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
-            "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f",
+            "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f subtask=%s",
             self.cfgrl_guidance_scale,
             guidance_type,
             "advantage" if self.cfgrl_guidance_scale > 0.0 else "off",
@@ -130,6 +166,7 @@ class Pi0Eval(EnvIO, Pi0):
             rtc_guidance_mode,
             "all" if self.rtc_guidance_steps is None else self.rtc_guidance_steps,
             rtc_guidance_clip,
+            self.subtask_mode or "off",
         )
 
     @torch.no_grad()
@@ -155,12 +192,15 @@ class Pi0Eval(EnvIO, Pi0):
         prompt = None
         plain_prefix = None
         cond_prefix = None
-        if self.sample_subtask_prediction:
+        if self.subtask_mode is not None:
             prompt = self._prompt_from_env_obs(env_obs)
             # Regenerate from the current observation on every request: the
             # subtask depends on what the cameras see, which changes per frame.
-            subtask = self.generate_subtask(observation, prompt)
-            plain_prefix = self._subtask_prefix_cache(observation, prompt, subtask)
+            if self.subtask_mode == "classifier":
+                subtask, plain_prefix = self.classify_subtask(observation, prompt)
+            else:
+                subtask = self.generate_subtask(observation, prompt)
+                plain_prefix = self._subtask_prefix_cache(observation, prompt, subtask)
             if plain_prefix is None:
                 observation = self._with_subtask_tokens(observation, prompt, subtask)
                 cond_observation = (
@@ -305,6 +345,85 @@ class Pi0Eval(EnvIO, Pi0):
                 f"got {sorted(env_obs)}"
             )
         return prompt
+
+    @torch.no_grad()
+    def classify_subtask(
+        self, observation: Observation, prompt: str
+    ) -> tuple[str, tuple | None]:
+        """Read the subtask class out of the prefix with the classification head.
+
+        One prefix forward plus the MLP replaces the per-token decode. The
+        prefix of the serving layout ends with ``Subtask: `` followed by the
+        reserved (masked) slots, so the cue token the head reads sits at the
+        same position it did in training.
+
+        Args:
+            observation: Serving observation built by the input transforms.
+            prompt: Task description of the request.
+
+        Returns:
+            ``(subtask text, action-branch prefix)``; the prefix is ``None``
+            when the generation-layout cache is unavailable, in which case the
+            caller tokenizes the training layout itself.
+        """
+        if self.subtask_classifier is None:
+            raise RuntimeError(
+                "classify_subtask needs a checkpoint trained with "
+                "subtask_classification=True."
+            )
+        if not self.subtask_classes:
+            raise RuntimeError(
+                "classify_subtask needs the class table (openpi.subtask_classes "
+                "or openpi.subtask_classes_path) to map an id back to text."
+            )
+        if self._subtask_tokenizer is None:
+            raise RuntimeError(
+                "classify_subtask needs the subtask tokenizer; call "
+                "setup_transforms with a TokenizePi05SubtaskInputs stage."
+            )
+        if observation.state.shape[0] != 1:
+            raise ValueError(
+                "subtask classification supports one request per call; got batch "
+                f"{observation.state.shape[0]}."
+            )
+
+        prepared = preprocess_observation(observation, train=False)
+        if prepared.token_ar_mask is None or prepared.tokenized_prompt is None:
+            raise ValueError(
+                "subtask classification needs a tokenized prompt with an AR mask; "
+                "the input pipeline did not apply TokenizePi05SubtaskInputs."
+            )
+        ar_mask = prepared.token_ar_mask.to(torch.bool)[0]
+        if not bool(ar_mask.any()):
+            raise ValueError(
+                "serving request has no reserved subtask slots (token_ar_mask is "
+                "all False); the prompt was tokenized for training, not serving."
+            )
+        # First reserved slot, i.e. the real prompt length of this request.
+        valid_len = int(ar_mask.to(torch.int32).argmax().item())
+
+        prefix_out, prefix_mask, kv_cache = self.build_prefix_cache(prepared)
+        logits = self.subtask_class_logits(prefix_out, prepared)
+        probs = F.softmax(logits.float(), dim=-1)[0]
+        class_id = int(logits[0].argmax().item())
+        if not 0 <= class_id < len(self.subtask_classes):
+            raise IndexError(
+                f"the head predicted class {class_id} but the class table has "
+                f"{len(self.subtask_classes)} entries; the checkpoint and the "
+                "table disagree, rebuild them together."
+            )
+        subtask = self.subtask_classes[class_id]
+        image_len = prefix_out.shape[1] - prepared.tokenized_prompt.shape[1]
+        # Same cache hand-off the generation path uses, so the action branch
+        # pays for the image/task prefix only once.
+        self._last_subtask_prefix = (prefix_mask, kv_cache, valid_len, image_len)
+        get_logger().info(
+            "Pi0Eval subtask classifier: class=%d conf=%.3f text=%s",
+            class_id,
+            float(probs[class_id].item()),
+            subtask,
+        )
+        return subtask, self._subtask_prefix_cache(observation, prompt, subtask)
 
     @torch.no_grad()
     def generate_subtask(self, observation: Observation, prompt: str) -> str:
@@ -542,11 +661,17 @@ class Pi0Eval(EnvIO, Pi0):
             if isinstance(transform, TokenizePi05SubtaskInputs):
                 self._subtask_tokenizer = transform.tokenizer
                 break
-        if self.sample_subtask_prediction and self._subtask_tokenizer is None:
+        if self.subtask_mode is not None and self._subtask_tokenizer is None:
             raise ValueError(
-                "sample_subtask_prediction is enabled but the input pipeline has "
-                "no TokenizePi05SubtaskInputs; build the model from a Zerith pi0.5 "
-                "config with the subtask tokenizer enabled."
+                f"subtask_mode={self.subtask_mode!r} is enabled but the input "
+                "pipeline has no TokenizePi05SubtaskInputs; build the model from a "
+                "Zerith pi0.5 config with the subtask tokenizer enabled."
+            )
+        if self.subtask_mode == "classifier" and self.subtask_classifier is None:
+            raise ValueError(
+                "subtask_mode='classifier' is enabled but the model has no "
+                "subtask_classifier; set openpi.subtask_classification=True to "
+                "match the trained checkpoint."
             )
         from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
             action_anchor_from_transforms,

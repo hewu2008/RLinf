@@ -313,10 +313,9 @@ class FSDPCfgWorker(FSDPSftWorker):
                 "prompt and the subtask loss stays zero."
             )
         max_subtask_len = int(
-            OmegaConf.select(
-                self.cfg.actor.model.openpi, "max_subtask_len", default=20
-            )
+            OmegaConf.select(self.cfg.actor.model.openpi, "max_subtask_len", default=20)
         )
+        self._validate_subtask_classes(subtasks, dataset_path)
         return dataclasses.replace(
             config,
             data=dataclasses.replace(
@@ -326,6 +325,37 @@ class FSDPCfgWorker(FSDPSftWorker):
                 max_subtask_len=max_subtask_len,
             ),
         )
+
+    def _validate_subtask_classes(
+        self, subtasks: dict[int, str], dataset_path: str
+    ) -> None:
+        """Check the class table the subtask classification head trains against.
+
+        ``subtask_index`` is the class id, so the mapping has to be ``0..K-1``
+        and ``K`` has to match ``num_subtask_classes``. A mismatch would train
+        the head on shifted labels without any visible error, hence the hard
+        failure instead of a warning.
+        """
+        openpi_cfg = self.cfg.actor.model.openpi
+        if not bool(
+            OmegaConf.select(openpi_cfg, "subtask_classification", default=False)
+        ):
+            return
+        configured = int(OmegaConf.select(openpi_cfg, "num_subtask_classes", default=0))
+        indices = sorted(subtasks)
+        if indices != list(range(len(indices))):
+            raise ValueError(
+                "subtask_classification needs contiguous subtask indices 0..K-1 "
+                f"from {dataset_path}/meta/subtasks.jsonl; got {indices}."
+            )
+        if configured != len(indices):
+            raise ValueError(
+                f"actor.model.openpi.num_subtask_classes={configured} but "
+                f"{dataset_path}/meta/subtasks.jsonl has {len(indices)} classes."
+            )
+        if self._rank == 0:
+            table = "; ".join(f"{index}={subtasks[index]}" for index in indices)
+            self.log_info(f"[subtask] class table ({len(indices)} classes): {table}")
 
     def _build_model_transforms(
         self, data_config: Any, train_subtask: bool = False

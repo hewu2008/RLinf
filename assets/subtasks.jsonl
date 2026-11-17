@@ -1,0 +1,13 @@
+{"subtask": "move both arms back to the home position", "subtask_index": 0}
+{"subtask": "place the L-shaped bent pipe in the right bin", "subtask_index": 1}
+{"subtask": "place the door handle in the left bin", "subtask_index": 2}
+{"subtask": "place the silver pipe in the front bin", "subtask_index": 3}
+{"subtask": "use the left arm to pick up the door handle in the left area of the blue bin", "subtask_index": 4}
+{"subtask": "use the left arm to pick up the door handle in the middle of the blue bin", "subtask_index": 5}
+{"subtask": "use the left arm to pick up the door handle in the right area of the blue bin", "subtask_index": 6}
+{"subtask": "use the right arm to pick up the L-shaped bent pipe in the left area of the blue bin", "subtask_index": 7}
+{"subtask": "use the right arm to pick up the L-shaped bent pipe in the middle of the blue bin", "subtask_index": 8}
+{"subtask": "use the right arm to pick up the L-shaped bent pipe in the right area of the blue bin", "subtask_index": 9}
+{"subtask": "use the right arm to pick up the silver pipe in the left area of the blue bin", "subtask_index": 10}
+{"subtask": "use the right arm to pick up the silver pipe in the middle of the blue bin", "subtask_index": 11}
+{"subtask": "use the right arm to pick up the silver pipe in the right area of the blue bin", "subtask_index": 12}

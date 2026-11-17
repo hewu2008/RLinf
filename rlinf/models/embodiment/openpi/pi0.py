@@ -31,6 +31,10 @@ import torch.nn.functional as F
 
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.openpi.modules import gemma, model, pointnet, siglip
+from rlinf.models.embodiment.openpi.modules.subtask import (
+    SubtaskClassifier,
+    subtask_cue_hidden,
+)
 from rlinf.models.embodiment.openpi.modules.utils import _str_to_dtype
 from rlinf.models.embodiment.openpi.pi0_config import Pi0Config
 from rlinf.models.embodiment.openpi.rlt_config import OpenPiPytorchRLTConfig
@@ -177,6 +181,7 @@ class Pi0(model.BaseModel):
         config_name: str = "",
         state_indices: Sequence[int] | None = None,
         rlt_cfg: OpenPiPytorchRLTConfig | None = None,
+        subtask_classes: Sequence[str] | None = None,
     ):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
@@ -189,6 +194,12 @@ class Pi0(model.BaseModel):
         self.max_subtask_len = int(config.max_subtask_len)
         self.subtask_temperature = float(config.subtask_temperature)
         self.subtask_decode_graph = bool(config.subtask_decode_graph)
+        self.subtask_classification = bool(config.subtask_classification)
+        # Class id -> subtask text, loaded from ``meta/subtasks.jsonl``; the
+        # classifier only predicts an id, the action branch needs the text.
+        self.subtask_classes = (
+            None if subtask_classes is None else list(subtask_classes)
+        )
         # ``None`` keeps :func:`euler_denoise_loop`; Pi0Eval.enable_sampler_graph
         # swaps in a captured CUDA graph for eval serving.
         self._plain_denoise_fn = None
@@ -233,6 +244,16 @@ class Pi0(model.BaseModel):
             )
 
         self.action_out_proj = nn.Linear(action_expert_width, config.action_dim)
+
+        # Optional subtask classification head: same shapes as the CFG-RL
+        # training model so ``subtask_classifier.*`` weights transfer as-is.
+        self.subtask_classifier: SubtaskClassifier | None = None
+        if config.subtask_classification:
+            self.subtask_classifier = SubtaskClassifier(
+                paligemma_config.width,
+                int(config.subtask_class_hidden_dim),
+                int(config.num_subtask_classes),
+            ).to(torch.float32)
 
         # Optional PointNet
         if config.pcd:
@@ -612,6 +633,23 @@ class Pi0(model.BaseModel):
         per_sample = per_sample.index_add(0, sample_idx, ce)
         counts = mask.sum(dim=-1).to(ce.dtype).clamp(min=1.0)
         return per_sample / counts
+
+    def subtask_class_logits(
+        self, prefix_out: torch.Tensor, observation: model.Observation
+    ) -> torch.Tensor:
+        """``(B, num_classes)`` subtask logits from the prefix cue hidden state.
+
+        ``prefix_out`` is the paligemma-side prefix output of a single prefix
+        forward; the cue token is the tail of ``Subtask: `` in both the training
+        and the reserved-slot serving layout (see
+        :func:`~.modules.subtask.subtask_cue_hidden`).
+        """
+        if self.subtask_classifier is None:
+            raise ValueError(
+                "Subtask classification head is disabled in this model config."
+            )
+        cue = subtask_cue_hidden(prefix_out, observation.token_ar_mask)
+        return self.subtask_classifier(cue.float())
 
     def build_prefix_cache(
         self, observation: model.Observation

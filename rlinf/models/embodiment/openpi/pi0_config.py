@@ -39,8 +39,9 @@ class Pi0Config:
     pcd: bool = False
 
     # pi0.5 high-level subtask prediction: the VLM predicts the current subtask
-    # as text and the action expert is conditioned on it. The classification
-    # head is intentionally not implemented; training is a token-level CE.
+    # as text and the action expert is conditioned on it. Training is a
+    # token-level CE; serving can also read a fixed class back from the
+    # classification head (see ``subtask_classification``).
     train_subtask_prediction: bool = False
     sample_subtask_prediction: bool = False
     # Weight of the subtask cross-entropy added to the flow-matching loss.
@@ -52,6 +53,17 @@ class Pi0Config:
     # Replay each decode step from a captured CUDA graph (falls back to eager
     # when CUDA or capture is unavailable).
     subtask_decode_graph: bool = True
+    # Sub-task stage at serving time: one prefix forward plus the classification
+    # head (``classifier``) or autoregressive text (``generate``). ``None`` or
+    # ``auto`` picks the fastest stage the checkpoint supports.
+    subtask_mode: str | None = None
+    # Fast subtask readout trained next to the token-level loss: the head maps
+    # the prefix cue hidden state to a class id, which is then mapped back to
+    # the class text and fed to the action expert.
+    subtask_classification: bool = False
+    # Number of subtask classes, i.e. rows of ``meta/subtasks.jsonl``.
+    num_subtask_classes: int = 0
+    subtask_class_hidden_dim: int = 512
 
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:
@@ -59,10 +71,22 @@ class Pi0Config:
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if (
-            self.train_subtask_prediction or self.sample_subtask_prediction
+            self.train_subtask_prediction
+            or self.sample_subtask_prediction
+            or self.subtask_classification
         ) and not self.pi05:
             raise ValueError(
                 "subtask prediction requires a pi0.5 model; got pi05=False."
+            )
+        if self.subtask_mode not in (None, "auto", "classifier", "generate", "off"):
+            raise ValueError(
+                "subtask_mode must be one of None, 'auto', 'classifier', "
+                f"'generate', 'off'; got {self.subtask_mode!r}."
+            )
+        if self.subtask_classification and self.num_subtask_classes <= 0:
+            raise ValueError(
+                "num_subtask_classes must be positive when "
+                f"subtask_classification is on; got {self.num_subtask_classes}."
             )
 
     def fake_obs(self, batch_size: int = 1) -> model.Observation:

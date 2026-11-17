@@ -46,6 +46,11 @@ from rlinf.models.embodiment.openpi.apxinf_adapter import (
     _active_token_ids,
 )
 from rlinf.models.embodiment.openpi.modules.model import IMAGE_KEYS, Observation
+from rlinf.models.embodiment.openpi.modules.subtask import (
+    SubtaskClassifier,
+    subtask_class_loss,
+    subtask_cue_hidden,
+)
 from rlinf.models.embodiment.openpi.pi0 import Pi0, euler_denoise_loop, make_attn_mask
 from rlinf.models.embodiment.openpi.sampling import rl_sampler
 from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
@@ -54,12 +59,17 @@ from rlinf.models.embodiment.openpi.sampling.rtc_guidance import (
     rtc_guidance_scale,
     sample_actions_with_rtc_guidance,
 )
-from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval, advantage_prompts
+from rlinf.models.embodiment.openpi.tasks.eval import (
+    Pi0Eval,
+    _resolve_subtask_mode,
+    advantage_prompts,
+)
 from rlinf.models.embodiment.openpi.transforms.subtask import (
     SubtaskFromIndex,
     SubtaskPaligemmaTokenizer,
     TokenizePi05SubtaskGuidanceInputs,
     TokenizePi05SubtaskInputs,
+    load_subtask_table,
     load_subtasks,
 )
 from rlinf.scheduler import Worker
@@ -3570,6 +3580,97 @@ def test_subtask_from_index_maps_missing_and_unknown_to_empty():
     assert transform({})["subtask"] == ""
 
 
+def test_subtask_from_index_emits_the_class_id():
+    transform = SubtaskFromIndex({2: "pick"})
+    assert int(transform({"subtask_index": 2})["subtask_class"]) == 2
+    # Unannotated frames carry -1 so the class loss ignores them.
+    assert int(transform({"subtask_index": -1})["subtask_class"]) == -1
+    assert int(transform({"subtask_index": 9})["subtask_class"]) == -1
+    assert int(transform({})["subtask_class"]) == -1
+
+
+def test_load_subtask_table_accepts_file_and_root(tmp_path):
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    table_path = meta / "subtasks.jsonl"
+    table_path.write_text(
+        '{"subtask_index": 0, "subtask": "home"}\n'
+        '{"subtask_index": 1, "subtask": "pick"}\n'
+    )
+    expected = {0: "home", 1: "pick"}
+    assert load_subtask_table(table_path) == expected
+    assert load_subtask_table(meta) == expected
+    assert load_subtask_table(tmp_path) == expected
+    with pytest.raises(FileNotFoundError, match="subtasks.jsonl"):
+        load_subtask_table(tmp_path / "missing")
+
+
+def test_subtask_classifier_reads_the_cue_token():
+    # 2 image tokens + 5 prompt tokens; the AR block starts at prompt index 3,
+    # so the cue is prompt index 2 for sample 0. Sample 1 has no annotation and
+    # falls back to its last prompt token.
+    prefix_out = torch.zeros(2, 7, 4)
+    for position in range(7):
+        prefix_out[:, position] = float(position)
+    token_ar_mask = torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 0, 0]], dtype=torch.bool)
+    cue = subtask_cue_hidden(prefix_out, token_ar_mask)
+    assert cue.shape == (2, 4)
+    assert cue[0, 0].item() == 4.0  # image_len 2 + cue index 2
+    assert cue[1, 0].item() == 6.0  # last prompt token
+
+
+def test_subtask_classifier_maps_cue_to_logits():
+    head = SubtaskClassifier(width=8, hidden_dim=4, num_classes=3)
+    logits = head(torch.randn(5, 8))
+    assert logits.shape == (5, 3)
+    assert logits.dtype == torch.float32
+    with pytest.raises(ValueError, match="num_classes"):
+        SubtaskClassifier(width=8, hidden_dim=4, num_classes=0)
+
+
+def test_subtask_class_loss_ignores_unannotated_frames():
+    logits = torch.tensor(
+        [
+            [5.0, 0.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0, 0.0],
+        ]
+    )
+    loss, accuracy, count = subtask_class_loss(logits, torch.tensor([0, -1, 3]))
+    assert count.item() == 2.0
+    # Sample 2 predicts class 2 against label 3, so the accuracy is 1/2.
+    assert accuracy.item() == 0.5
+    # Only the annotated rows are scored; the -1 row contributes nothing.
+    expected = torch.nn.functional.cross_entropy(logits[[0, 2]], torch.tensor([0, 3]))
+    assert loss.item() == pytest.approx(expected.item())
+
+    zeros_loss, zeros_accuracy, zeros_count = subtask_class_loss(
+        logits, torch.tensor([-1, -1, -1])
+    )
+    assert zeros_count.item() == 0.0
+    assert zeros_loss.item() == 0.0 and zeros_accuracy.item() == 0.0
+
+
+def test_subtask_classifier_resolution_prefers_the_head():
+    def config(**kwargs):
+        return SimpleNamespace(
+            subtask_mode=kwargs.get("mode"),
+            subtask_classification=kwargs.get("classification", False),
+            sample_subtask_prediction=kwargs.get("generate", False),
+        )
+
+    assert _resolve_subtask_mode(config(classification=True)) == "classifier"
+    assert _resolve_subtask_mode(config(generate=True)) == "generate"
+    assert _resolve_subtask_mode(config()) is None
+    assert _resolve_subtask_mode(config(mode="off", classification=True)) is None
+    assert (
+        _resolve_subtask_mode(config(mode="generate", classification=True))
+        == "generate"
+    )
+    with pytest.raises(ValueError, match="classifier"):
+        _resolve_subtask_mode(config(mode="classifier"))
+
+
 def test_subtask_tokenizer_marks_only_the_subtask_for_loss():
     tokenizer = _subtask_tokenizer()
     tokens, token_mask, ar_mask, loss_mask = tokenizer.tokenize_subtask_training(
@@ -3743,6 +3844,51 @@ def test_generate_subtask_stops_at_eos(monkeypatch):
     text = Pi0Eval.generate_subtask(model, observation, "task")
     assert text == ""
     assert fake_llm.calls == 1
+
+
+def test_classify_subtask_picks_the_class_and_caches_the_prefix(monkeypatch):
+    monkeypatch.setattr(
+        "rlinf.models.embodiment.openpi.tasks.eval.preprocess_observation",
+        lambda obs, train: obs,
+    )
+    head = SubtaskClassifier(width=4, hidden_dim=2, num_classes=3)
+    with torch.no_grad():
+        # Constant cue -> a fixed argmax, so the test checks the plumbing only.
+        head.out.weight.zero_()
+        head.out.bias.copy_(torch.tensor([0.0, 3.0, 0.0]))
+    model = SimpleNamespace(
+        subtask_classifier=head,
+        subtask_classes=["home", "pick", "place"],
+        _subtask_tokenizer=object(),
+        _last_subtask_prefix=None,
+    )
+    model.subtask_class_logits = lambda prefix_out, observation: (
+        Pi0.subtask_class_logits(model, prefix_out, observation)
+    )
+    # 2 image tokens + a 4-token prompt whose last two positions are the
+    # reserved subtask slots.
+    prefix_out = torch.zeros(1, 6, 4)
+    model.build_prefix_cache = lambda observation: (
+        prefix_out,
+        torch.ones(1, 6, dtype=torch.bool),
+        ("kv",),
+    )
+    model._subtask_prefix_cache = lambda observation, prompt, subtask: (
+        "prefix",
+        subtask,
+    )
+    observation = SimpleNamespace(
+        state=torch.zeros(1, 4),
+        tokenized_prompt=torch.zeros(1, 4, dtype=torch.long),
+        token_ar_mask=torch.tensor([[0, 0, 1, 1]], dtype=torch.bool),
+    )
+
+    text, prefix = Pi0Eval.classify_subtask(model, observation, "task")
+    assert text == "pick"
+    assert prefix == ("prefix", "pick")
+    # valid_len is the first reserved slot, i.e. the real prompt length.
+    assert model._last_subtask_prefix[2] == 2
+    assert model._last_subtask_prefix[3] == 2
 
 
 class _RecordingDecodeLLM:
