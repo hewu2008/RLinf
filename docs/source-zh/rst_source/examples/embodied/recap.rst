@@ -691,10 +691,9 @@ Subtask 预测训练（可选）
          train_subtask_prediction: true
          subtask_loss_weight: 1.0     # 子任务交叉熵相对动作损失的权重
          max_subtask_len: 20          # 监督/生成子任务的最大 token 数
-         subtask_classification: true # 可选：在同一批帧上训练分类头
+         subtask_classification: true # 在同一批帧上训练分类头
          num_subtask_classes: 13      # meta/subtasks.jsonl 的行数
-         subtask_class_loss_weight: 0.2
-         subtask_class_lr_multiplier: 100.0
+         subtask_class_loss_weight: 0.1
 
 开启后，训练日志会额外输出 ``subtask_loss``；CFG 训练还会输出 ``subtask_token_accuracy``。
 若数据集缺少 ``subtasks.jsonl``，所有帧会回退到普通 pi0.5 prompt，子任务损失恒为 0。
@@ -708,9 +707,9 @@ Subtask 预测训练（可选）
 同时继续训练，所以一次训练可同时支持两种推理方式。
 
 类别 id 就是 ``meta/subtasks.jsonl`` 的 ``subtask_index``，因此它必须是
-``0..num_subtask_classes-1``；不一致时训练直接报错，而不是静默错标。分类头是随机初始化的，而骨干
-已收敛，所以它单独占一个优化器参数组，学习率为 ``subtask_class_lr_multiplier`` 倍
-``actor.optim.lr``（FSDP 优化器按名字拆分参数组）。训练日志新增 ``subtask_class_loss`` 与
+``0..num_subtask_classes-1``；不一致时训练直接报错，而不是静默错标。分类头是策略的一部分：与骨干
+共用同一个 actor 优化器和学习率，没有单独的优化器参数组。CFG-RL 示例已默认开启
+（``examples/offline_rl/config/cfg_rl_openpi.yaml``）。训练日志新增 ``subtask_class_loss`` 与
 ``subtask_class_accuracy``。
 
 .. note::
@@ -724,8 +723,8 @@ Subtask 预测训练（可选）
 
 - ``classifier``：一次 prefix 前向加分类头，再用预测出的类别文本作为动作分支的条件，不再逐 token 解码；
 - ``generate``：从 ``Task/State/\nSubtask: `` 前缀自回归生成子任务文本，再按训练布局重新编码；
-- ``off``：不启用子任务阶段，直接用普通 prompt 采样。``auto``（或不填）优先使用分类头，没有分类头
-  时回退到生成。
+- ``off``：不启用子任务阶段，直接用普通 prompt 采样；``auto`` 或不填时优先使用分类头，没有分类头时
+  回退到生成。
 
 两种方式得到的文本都交给原有的去噪采样，RTC 与 CFG 引导保持不变。服务端配置：
 

@@ -703,10 +703,9 @@ and can optionally train a classification head on the same frames.
          train_subtask_prediction: true
          subtask_loss_weight: 1.0     # weight of the subtask CE against the action loss
          max_subtask_len: 20          # cap on the supervised and generated subtask length
-         subtask_classification: true # optional classification head on the same frames
+         subtask_classification: true # classification head on the same frames
          num_subtask_classes: 13      # rows of meta/subtasks.jsonl
-         subtask_class_loss_weight: 0.2
-         subtask_class_lr_multiplier: 100.0
+         subtask_class_loss_weight: 0.1
 
 Training logs then add ``subtask_loss``; CFG training also reports ``subtask_token_accuracy``.
 A dataset without ``subtasks.jsonl`` falls back to the plain pi0.5 prompt on every frame, so the
@@ -722,10 +721,11 @@ layout) and predicts a class id. Its cross-entropy is added to the action loss w
 token-level loss keeps training alongside it, so one run serves both serving stages.
 
 The class ids are the ``subtask_index`` values of ``meta/subtasks.jsonl``, which therefore has to be
-``0..num_subtask_classes-1``; a mismatch fails the run instead of shifting labels. The head starts
-from random weights on a converged backbone, so it takes its own optimizer group at
-``subtask_class_lr_multiplier`` times ``actor.optim.lr`` (the FSDP optimizer splits parameter groups
-by name). Training logs add ``subtask_class_loss`` and ``subtask_class_accuracy``.
+``0..num_subtask_classes-1``; a mismatch fails the run instead of shifting labels. The head is a
+regular part of the policy: it shares the actor optimizer and learning rate with the backbone and
+has no separate parameter group. The CFG-RL example enables it by default
+(``examples/offline_rl/config/cfg_rl_openpi.yaml``). Training logs add ``subtask_class_loss`` and
+``subtask_class_accuracy``.
 
 .. note::
 

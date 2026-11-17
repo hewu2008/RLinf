@@ -52,7 +52,13 @@ class SubtaskClassifier(nn.Module):
         self.out = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Map ``(B, width)`` cue hidden states to ``(B, num_classes)`` logits."""
+        """Map ``(B, width)`` cue hidden states to ``(B, num_classes)`` logits.
+
+        The input is cast to the parameter dtype first: the head is built in
+        fp32, but a ``model.to(bf16)`` on the host policy would otherwise make
+        the matmul dtypes disagree with the bf16 prefix states.
+        """
+        x = x.to(self.out.weight.dtype)
         return self.out(F.gelu(self.hidden(self.norm(x))))
 
 

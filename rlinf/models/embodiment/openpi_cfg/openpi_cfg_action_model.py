@@ -200,10 +200,7 @@ class OpenPi0Config(Pi0Config):
     num_subtask_classes: int = 0
     subtask_class_hidden_dim: int = 512
     # Weight of the subtask class cross-entropy added to the action loss.
-    subtask_class_loss_weight: float = 0.2
-    # The head is randomly initialized while the backbone is converged, so it
-    # takes its own optimizer group with a larger lr (same warmup/cosine shape).
-    subtask_class_lr_multiplier: float = 100.0
+    subtask_class_loss_weight: float = 0.1
 
     def __post_init__(self):
         if self.guidance_type not in _VALID_GUIDANCE_TYPES:
@@ -305,18 +302,14 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             import openpi.models.gemma as _gemma
 
             # fp32 readout of the bf16 residual stream: the two layers are ~1M
-            # parameters against the 2B VLM, so the extra copy is free.
+            # parameters against the 2B VLM, so the extra copy is free. The head
+            # shares the actor optimizer and lr; it is trained end to end with
+            # the backbone rather than through its own parameter group.
             self.subtask_classifier = SubtaskClassifier(
                 _gemma.get_config(config.paligemma_variant).width,
                 int(config.subtask_class_hidden_dim),
                 int(config.num_subtask_classes),
             ).to(torch.float32)
-            # The head is randomly initialized while the backbone is converged,
-            # so it takes its own optimizer group (see
-            # ``FSDPModelManager.build_optimizer``) with a scaled lr.
-            self.lr_multipliers = {
-                "subtask_classifier": float(config.subtask_class_lr_multiplier)
-            }
         for name, module in self.named_modules():
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
