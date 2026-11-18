@@ -67,8 +67,10 @@ openpi:
   num_subtask_classes: 13
   subtask_class_hidden_dim: 512
   # Class id -> text table used to turn a predicted class back into the prompt
-  # text. Point at the jsonl file, its directory, or the dataset root.
-  subtask_classes_path: /data/4T-2/dataset/hewu2008/part_sorting_20261027_subtask/meta/subtasks.jsonl
+  # text. Point at the jsonl file, its directory, or the dataset root; a
+  # relative path is resolved against the working directory, i.e. the repository
+  # root when the server is started from there.
+  subtask_classes_path: assets/subtasks.jsonl
   sample_subtask_prediction: true
   subtask_temperature: 0.0
   max_subtask_len: 24
