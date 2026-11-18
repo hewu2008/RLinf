@@ -72,6 +72,17 @@ openpi:
   sample_subtask_prediction: true
   subtask_temperature: 0.0
   max_subtask_len: 24
+  # Sticky class for the classifier stage: one request reads one frame, so a
+  # single misread would switch the action condition of that chunk. A switch
+  # needs `subtask_switch_patience` consecutive requests whose top-1
+  # probability clears `subtask_conf_threshold`; `subtask_force_switch` bounds
+  # how long a transition below the threshold is held back. At the RTC request
+  # rate (~2/s) patience 3 is about 1.5 s and force 6 about 3 s, which stays
+  # well inside the shortest common stage (dataset p10 is 7.2 s) so a real
+  # transition still lands in its own stage. Set 0/1/0 for the plain argmax.
+  subtask_conf_threshold: 0.90
+  subtask_switch_patience: 3
+  subtask_force_switch: 6
   # Replay each decode step from a captured CUDA graph (falls back to eager
   # without CUDA). Measured 15 ms -> 6 ms per token on the 2B model; ignored by
   # the classifier stage, which never decodes.

@@ -84,6 +84,56 @@ def advantage_prompts(descriptions: Sequence[str], guidance_type: str) -> list[s
     ]
 
 
+SubtaskStickyState = tuple[int, int, int]
+"""``(served class, candidate class, candidate streak)`` kept across requests."""
+
+
+def stabilize_subtask_class(
+    state: SubtaskStickyState | None,
+    class_id: int,
+    conf: float,
+    *,
+    threshold: float,
+    patience: int,
+    force_switch: int,
+) -> tuple[int, SubtaskStickyState, bool]:
+    """Hold the served subtask class until a new one wins ``patience`` requests.
+
+    A request reads one frame, so a single misread would flip the action
+    condition of its chunk. A switch needs ``patience`` consecutive requests for
+    the same class whose top-1 probability clears ``threshold``; a non-zero
+    ``force_switch`` also admits a candidate that stayed on top that many
+    requests below the threshold, so a real transition cannot be held back
+    forever.
+
+    Args:
+        state: State returned by the previous request, ``None`` for the first.
+        class_id: Class read from this frame.
+        conf: Top-1 probability of that class.
+        threshold: Minimum probability for a switch to count.
+        patience: Consecutive requests a candidate needs before it is served.
+        force_switch: Requests after which a candidate switches regardless of
+            ``threshold``; 0 disables that bound.
+
+    Returns:
+        ``(served class, next state, whether the read class was held back)``.
+    """
+    if state is None:
+        return class_id, (class_id, class_id, 1), False
+    served, candidate, streak = state
+    if class_id == candidate:
+        streak += 1
+    else:
+        candidate, streak = class_id, 1
+    if class_id == served:
+        return served, (served, candidate, streak), False
+    if streak >= patience and conf >= threshold:
+        return class_id, (class_id, candidate, streak), False
+    if force_switch > 0 and streak >= force_switch:
+        return class_id, (class_id, candidate, streak), False
+    return served, (served, candidate, streak), True
+
+
 class Pi0Eval(EnvIO, Pi0):
     """Inference-only: deterministic Euler sampling, optional CFG / RTC guidance."""
 
@@ -142,6 +192,11 @@ class Pi0Eval(EnvIO, Pi0):
         # ``generate`` decodes the subtask text token by token, ``None`` skips
         # the stage. Both stages condition the action branch on the text.
         self.subtask_mode = _resolve_subtask_mode(config)
+        # Cross-request state of the sticky class, reset per connection.
+        self.subtask_conf_threshold = float(config.subtask_conf_threshold)
+        self.subtask_switch_patience = int(config.subtask_switch_patience)
+        self.subtask_force_switch = int(config.subtask_force_switch)
+        self._subtask_sticky: SubtaskStickyState | None = None
         # Both stay ``None`` (the eager loops) until enable_sampler_graph swaps
         # in captured CUDA graphs.
         self._rtc_denoise_fn = None
@@ -157,7 +212,8 @@ class Pi0Eval(EnvIO, Pi0):
         self._last_subtask_prefix = None
         get_logger().info(
             "Pi0Eval: cfgrl_guidance_scale=%.3f guidance_type=%s cond_branch=%s "
-            "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f subtask=%s",
+            "num_steps=%d rtc=%s mode=%s steps=%s clip=%.2f subtask=%s "
+            "sticky_conf/patience/force=%.2f/%d/%d",
             self.cfgrl_guidance_scale,
             guidance_type,
             "advantage" if self.cfgrl_guidance_scale > 0.0 else "off",
@@ -167,6 +223,9 @@ class Pi0Eval(EnvIO, Pi0):
             "all" if self.rtc_guidance_steps is None else self.rtc_guidance_steps,
             rtc_guidance_clip,
             self.subtask_mode or "off",
+            self.subtask_conf_threshold,
+            self.subtask_switch_patience,
+            self.subtask_force_switch,
         )
 
     @torch.no_grad()
@@ -405,25 +464,40 @@ class Pi0Eval(EnvIO, Pi0):
         prefix_out, prefix_mask, kv_cache = self.build_prefix_cache(prepared)
         logits = self.subtask_class_logits(prefix_out, prepared)
         probs = F.softmax(logits.float(), dim=-1)[0]
-        class_id = int(logits[0].argmax().item())
-        if not 0 <= class_id < len(self.subtask_classes):
+        read_class = int(logits[0].argmax().item())
+        if not 0 <= read_class < len(self.subtask_classes):
             raise IndexError(
-                f"the head predicted class {class_id} but the class table has "
+                f"the head predicted class {read_class} but the class table has "
                 f"{len(self.subtask_classes)} entries; the checkpoint and the "
                 "table disagree, rebuild them together."
             )
+        conf = float(probs[read_class].item())
+        class_id, self._subtask_sticky, held = stabilize_subtask_class(
+            self._subtask_sticky,
+            read_class,
+            conf,
+            threshold=self.subtask_conf_threshold,
+            patience=self.subtask_switch_patience,
+            force_switch=self.subtask_force_switch,
+        )
         subtask = self.subtask_classes[class_id]
         image_len = prefix_out.shape[1] - prepared.tokenized_prompt.shape[1]
         # Same cache hand-off the generation path uses, so the action branch
         # pays for the image/task prefix only once.
         self._last_subtask_prefix = (prefix_mask, kv_cache, valid_len, image_len)
         get_logger().info(
-            "Pi0Eval subtask classifier: class=%d conf=%.3f text=%s",
+            "Pi0Eval subtask classifier: read=%d conf=%.3f served=%d%s text=%s",
+            read_class,
+            conf,
             class_id,
-            float(probs[class_id].item()),
+            " (held)" if held else "",
             subtask,
         )
         return subtask, self._subtask_prefix_cache(observation, prompt, subtask)
+
+    def reset_subtask_sticky(self) -> None:
+        """Forget the served class so a new connection starts from its own read."""
+        self._subtask_sticky = None
 
     @torch.no_grad()
     def generate_subtask(self, observation: Observation, prompt: str) -> str:

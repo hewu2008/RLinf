@@ -63,6 +63,7 @@ from rlinf.models.embodiment.openpi.tasks.eval import (
     Pi0Eval,
     _resolve_subtask_mode,
     advantage_prompts,
+    stabilize_subtask_class,
 )
 from rlinf.models.embodiment.openpi.transforms.subtask import (
     SubtaskFromIndex,
@@ -3697,6 +3698,52 @@ def test_subtask_classifier_resolution_prefers_the_head():
     )
     with pytest.raises(ValueError, match="classifier"):
         _resolve_subtask_mode(config(mode="classifier"))
+
+
+def test_subtask_sticky_class_holds_single_misreads():
+    hold = {"threshold": 0.9, "patience": 3, "force_switch": 0}
+    served, state, held = stabilize_subtask_class(None, 4, 0.99, **hold)
+    assert served == 4 and held is False
+
+    # One misread frame never switches the served class.
+    served, state, held = stabilize_subtask_class(state, 5, 0.97, **hold)
+    assert served == 4 and held is True
+
+    # A read of the served class drops the candidate.
+    served, state, held = stabilize_subtask_class(state, 4, 0.99, **hold)
+    assert served == 4 and held is False and state[1] == 4
+
+    # Three consecutive confident reads of the same class do switch.
+    for expected_held in (True, True, False):
+        served, state, held = stabilize_subtask_class(state, 5, 0.97, **hold)
+        assert held is expected_held
+    assert served == 5
+
+
+def test_subtask_sticky_class_needs_confident_reads():
+    hold = {"threshold": 0.9, "patience": 2, "force_switch": 0}
+    _, state, _ = stabilize_subtask_class(None, 1, 0.99, **hold)
+    for _ in range(5):
+        served, state, held = stabilize_subtask_class(state, 2, 0.60, **hold)
+        assert served == 1 and held is True
+
+
+def test_subtask_sticky_class_force_switches_a_low_conf_transition():
+    hold = {"threshold": 0.9, "patience": 3, "force_switch": 4}
+    _, state, _ = stabilize_subtask_class(None, 0, 0.99, **hold)
+    served_ids = []
+    for _ in range(4):
+        served, state, _ = stabilize_subtask_class(state, 6, 0.50, **hold)
+        served_ids.append(served)
+    assert served_ids == [0, 0, 0, 6]
+
+
+def test_subtask_sticky_class_defaults_match_plain_argmax():
+    hold = {"threshold": 0.0, "patience": 1, "force_switch": 0}
+    state = None
+    for class_id in (3, 7, 3, 9):
+        served, state, held = stabilize_subtask_class(state, class_id, 0.4, **hold)
+        assert served == class_id and held is False
 
 
 def test_subtask_tokenizer_marks_only_the_subtask_for_loss():

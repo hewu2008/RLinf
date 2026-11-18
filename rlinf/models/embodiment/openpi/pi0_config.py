@@ -64,6 +64,15 @@ class Pi0Config:
     # Number of subtask classes, i.e. rows of ``meta/subtasks.jsonl``.
     num_subtask_classes: int = 0
     subtask_class_hidden_dim: int = 512
+    # Sticky serving class: one frame reads one class, so a single misread flips
+    # the action condition for that chunk. A change needs
+    # ``subtask_switch_patience`` consecutive requests whose top-1 probability
+    # clears ``subtask_conf_threshold``, and ``subtask_force_switch`` bounds how
+    # long a transition below the threshold is held back (0 disables the bound).
+    # The defaults reproduce the plain per-frame argmax.
+    subtask_conf_threshold: float = 0.0
+    subtask_switch_patience: int = 1
+    subtask_force_switch: int = 0
 
     def __post_init__(self):
         if self.pi05 and self.max_token_len == 48:
@@ -87,6 +96,20 @@ class Pi0Config:
             raise ValueError(
                 "num_subtask_classes must be positive when "
                 f"subtask_classification is on; got {self.num_subtask_classes}."
+            )
+        if not 0.0 <= self.subtask_conf_threshold <= 1.0:
+            raise ValueError(
+                "subtask_conf_threshold must be in [0, 1]; "
+                f"got {self.subtask_conf_threshold}."
+            )
+        if self.subtask_switch_patience < 1:
+            raise ValueError(
+                "subtask_switch_patience must be at least 1; "
+                f"got {self.subtask_switch_patience}."
+            )
+        if self.subtask_force_switch < 0:
+            raise ValueError(
+                f"subtask_force_switch must be >= 0; got {self.subtask_force_switch}."
             )
 
     def fake_obs(self, batch_size: int = 1) -> model.Observation:

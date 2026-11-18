@@ -141,6 +141,9 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         ("max_subtask_len", int),
         ("num_subtask_classes", int),
         ("subtask_class_hidden_dim", int),
+        ("subtask_conf_threshold", float),
+        ("subtask_switch_patience", int),
+        ("subtask_force_switch", int),
     ):
         value = OmegaConf.select(model_cfg, key, default=None)
         if value is not None:

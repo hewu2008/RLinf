@@ -131,6 +131,9 @@ class PolicyService:
 
     def new_session(self) -> RTCSession:
         """Create the state of a fresh connection."""
+        reset = getattr(self._model, "reset_subtask_sticky", None)
+        if reset is not None:
+            reset()
         return RTCSession()
 
     def warmup(self, steps: int = 1) -> None:
