@@ -364,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
             control_frequency=args.control_freq,
             jpeg_quality=args.record_jpeg_quality,
         )
-    episode = {"index": 1, "steps": 0}
+    episode = {"index": 1, "steps": 0, "holds": 0}
 
     def record_commanded(observation: Mapping[str, Any], joints: np.ndarray) -> None:
         """Record one step: the observation plus the joint targets sent to the motors."""
@@ -439,10 +439,11 @@ def main(argv: list[str] | None = None) -> None:
             recorder.reset()
         keys.stop()
         logger.info(
-            "episode %d ended after %d steps; reset the scene, then type ``c`` "
-            "to start the next one",
+            "episode %d ended after %d steps (%d holding); reset the scene, then "
+            "type ``c`` to start the next one",
             episode["index"],
             episode["steps"],
+            episode["holds"],
         )
         pdb.set_trace()
         keys.start()
@@ -452,6 +453,7 @@ def main(argv: list[str] | None = None) -> None:
         subtask_state.update(norm=None)
         episode["index"] += 1
         episode["steps"] = 0
+        episode["holds"] = 0
         if not start_episode():
             raise RuntimeError(
                 f"no action chunk for episode {episode['index']} after "
@@ -492,7 +494,13 @@ def main(argv: list[str] | None = None) -> None:
         action = scheduler.get_action(request)
         if action is None:
             logger.warning("step %d: no action queued, holding the current pose", step)
-            env.set_joint_action(state[: env.motor_count])
+            held = state[: env.motor_count]
+            env.set_joint_action(held)
+            # The arm still spends this step holding position, so the hold is a
+            # real executed action: leaving it out of the recording would put a
+            # gap between the neighbouring frames that no action explains.
+            record_commanded(observation, held)
+            episode["holds"] += 1
         else:
             commanded = postprocess_action(np.copy(action), gripper)[:-2]
             env.set_joint_action(commanded)
