@@ -26,8 +26,8 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Defaults follow the part-sorting run this converter was written for.
-DEFAULT_RAW_DIR="/data/4T-2/mocap_data/hdf5/part-sorting-20261027"
-DEFAULT_REPO_ID="hewu2008/part_sorting_20261027"
+DEFAULT_RAW_DIR="/data/4T-2/mocap_data/hdf5/part-sorting-20261119"
+DEFAULT_REPO_ID="hewu2008/part_sorting_20261119"
 
 HF_LEROBOT_HOME=${HF_LEROBOT_HOME:-/data/4T-2/dataset}
 export HF_LEROBOT_HOME
